@@ -1,0 +1,19 @@
+# credentials
+.env
+config.py
+
+# runtime outputs
+watchlist/*.json
+state.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace

@@ -1,0 +1,65 @@
+"""
+Copy this file to config.py and fill in your credentials before running.
+config.py is excluded from git via .gitignore.
+"""
+from types import SimpleNamespace
+
+# ── IBKR connection ───────────────────────────────────────────────────────────
+IBKR_HOST      = "127.0.0.1"
+LIVE_TRADING   = False
+IBKR_PORT      = 7496 if LIVE_TRADING else 7497   # TWS: 7497 paper / 7496 live
+IBKR_CLIENT_ID = 36                                # keep different from candle-scalping-bot (35)
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID"
+
+# ── Capital & risk ────────────────────────────────────────────────────────────
+HOUSE_MONEY_EUR           = 5_000   # total deployable capital — never exceed principal
+RISK_PER_TRADE_PCT        = 0.01    # 1 % per trade ≈ €50
+MAX_CONCURRENT_POSITIONS  = 3       # one per screener pick
+MAX_TRADES_PER_SYMBOL_PER_DAY = 1
+
+# ── Files ─────────────────────────────────────────────────────────────────────
+WATCHLIST_DIR = "watchlist"
+STATE_FILE    = "state.json"
+
+# ── Intraday params — single source of truth for live bot AND backtest ────────
+# Mechanical knobs (rvol, gap, ATR) tune on the historical backtest.
+# LLM-dependent knobs (category_weights, direction_threshold) validate forward
+# on paper only — never backtest these (lookahead bias).
+INTRADAY_PARAMS = SimpleNamespace(
+    # ── ORB mechanics ────────────────────────────────────────────────
+    orb_range_minutes     = 5,
+    orb_rvol_gate         = 1.5,     # breakout candle RVOL floor (live gate)
+    tp_r_multiple         = 2.0,     # take-profit = entry ± (R × stop-distance)
+    sl_mode               = "range_edge",  # "range_edge" | "atr"
+    atr_mult              = 1.0,
+    require_retest        = True,
+    retest_tolerance_pct  = 0.0005,  # 5 bps of mid-range price
+    min_range_pct         = 0.0015,  # skip days where opening range < 0.15 % of price
+    rvol_rolling_window   = 10,      # bars to look back for RVOL baseline
+    poll_interval_sec     = 60,
+
+    # ── Screener gates (Phase 1) ──────────────────────────────────────
+    rvol_hard_floor       = 1.5,     # < this → hard NOTHING veto
+    rvol_midtier_cap      = 60,      # conviction clamped here for 1.5–3× RVOL
+    gap_min_pct           = 0.5,     # minimum gap % to qualify
+    min_dollar_volume     = 50_000_000,
+    shortlist_size        = 5,
+    max_per_sector        = 2,
+    direction_threshold   = 0.3,     # net vote fraction to declare LONG/SHORT
+
+    # ── Screener category weights (Phase 1 — tune forward on paper only) ──
+    category_weights = {
+        "momentum":      0.25,
+        "fundamentals":  0.20,
+        "sentiment":     0.20,
+        "macro":         0.15,
+        "quant":         0.20,
+    },
+
+    # ── Cost model ────────────────────────────────────────────────────
+    slippage_pct          = 0.0002,
+    commission_per_share  = 0.005,
+)
