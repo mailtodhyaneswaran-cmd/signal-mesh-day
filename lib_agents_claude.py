@@ -74,7 +74,23 @@ class ClaudeAgent(BaseAgent):
             except json.JSONDecodeError:
                 pass
 
-            match = re.search(r"\{.*\}", output, re.DOTALL)
+            # Strip markdown fences then retry
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", output, flags=re.DOTALL).strip()
+            try:
+                return json.loads(clean)
+            except json.JSONDecodeError:
+                pass
+
+            # Try first JSON object {...}
+            match = re.search(r"\{.*\}", clean, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+            # Try first JSON array [...] (bulk responses)
+            match = re.search(r"\[.*\]", clean, re.DOTALL)
             if match:
                 try:
                     return json.loads(match.group())

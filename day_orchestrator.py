@@ -41,6 +41,7 @@ from day_trading_prompts import (
     CROSS_POLLINATION_PROMPT,
     aggregate_ticker,
     rvol_conviction_cap,
+    build_bulk_category_prompt,
 )
 from sp500_universe import get_sp500_tickers
 from premarket_data import fetch_market_context, batch_gap_scan, enrich_ticker
@@ -79,29 +80,101 @@ def _build_agents(verbose: bool) -> dict:
     return agents
 
 
-# ── Round-1: run all 25 prompts ───────────────────────────────────────────────
+# ── Round-1: 5 bulk prompts per agent (one per category) ─────────────────────
+
+def _parse_bulk_response(
+    raw:         object,
+    category:    str,
+    prompt_keys: list[str],
+) -> list[dict]:
+    """
+    Parse one agent's response to a bulk category prompt.
+
+    The LLM is asked to return a JSON array of N objects. This function
+    normalises whatever comes back into a list of N tagged result dicts.
+    Handles: direct list, dict with nested array, single dict, or error.
+    """
+    import json as _json
+
+    items = None
+
+    if isinstance(raw, list):
+        items = raw
+
+    elif isinstance(raw, dict):
+        # Check for embedded JSON array in a "raw" error field
+        if items is None and "raw" in raw:
+            try:
+                parsed = _json.loads(raw["raw"])
+                if isinstance(parsed, list):
+                    items = parsed
+            except Exception:
+                pass
+        # Check common wrapper keys
+        if items is None:
+            for wrap_key in ("results", "analyses", "data", "items", "answers"):
+                if wrap_key in raw and isinstance(raw[wrap_key], list):
+                    items = raw[wrap_key]
+                    break
+        # Propagate hard error to all sub-prompts
+        if items is None and "error" in raw:
+            return [
+                {"signal": "NOTHING", "conviction": 0, "category": category,
+                 "prompt_key": k, "error": raw["error"]}
+                for k in prompt_keys
+            ]
+        # Single result dict — wrap as one-element list
+        if items is None:
+            items = [raw]
+
+    if not items:
+        return [
+            {"signal": "NOTHING", "conviction": 0, "category": category,
+             "prompt_key": k, "error": "empty bulk response"}
+            for k in prompt_keys
+        ]
+
+    # Map items → prompt keys in order; pad with defaults if LLM returned fewer
+    results = []
+    for i, key in enumerate(prompt_keys):
+        r = dict(items[i]) if i < len(items) and isinstance(items[i], dict) else {}
+        r.setdefault("signal",     "NOTHING")
+        r.setdefault("conviction", 0)
+        r["category"]   = category
+        r["prompt_key"] = key
+        results.append(r)
+    return results
+
 
 def _run_round1(prompt_data: dict, agents: dict) -> dict[str, list[dict]]:
     """
-    Run all 25 prompts for each agent.
-    Returns {agent_name: [result_dict_with_category_tag, ...]}.
+    Run 5 BULK prompts per agent — one per category, each containing all 5 sub-prompts.
+    Returns a JSON array of 5 results per call → 5 API calls × N agents (vs 25 before).
+
+    Returns {agent_name: [25 tagged result dicts]}.
     """
     results: dict[str, list[dict]] = {}
     for agent_name, agent in agents.items():
         agent_results = []
         for category, prompts in ALL_INTRADAY_PROMPTS.items():
-            for prompt_key, template in prompts.items():
-                filled = template.format_map(_SafeDict(prompt_data))
-                r = agent.fetch_data(filled)
-                r.setdefault("signal",     "NOTHING")
-                r.setdefault("conviction", 0)
-                r["category"]   = category
-                r["prompt_key"] = prompt_key
-                r["agent"]      = agent_name
-                agent_results.append(r)
+            # Pre-fill every template with real data
+            filled = [
+                (key, template.format_map(_SafeDict(prompt_data)))
+                for key, template in prompts.items()
+            ]
+            # One API call per category
+            bulk_prompt = build_bulk_category_prompt(category, filled)
+            raw         = agent.fetch_data(bulk_prompt)
+            # Parse the JSON array of 5 back into individual result dicts
+            parsed = _parse_bulk_response(raw, category, list(prompts.keys()))
+            for r in parsed:
+                r["agent"] = agent_name
+            agent_results.extend(parsed)
+
         results[agent_name] = agent_results
         wins = sum(1 for r in agent_results if "error" not in r)
-        print(f"    [{agent_name}] {wins}/{len(agent_results)} prompts OK")
+        print(f"    [{agent_name}] {wins}/{len(agent_results)} results OK "
+              f"(5 bulk calls)")
     return results
 
 

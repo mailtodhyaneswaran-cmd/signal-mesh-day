@@ -741,6 +741,45 @@ ALL_INTRADAY_PROMPTS = {
     "quant_edge":     QUANT_EDGE_PROMPTS,
 }
 
+
+def build_bulk_category_prompt(category: str, filled_prompts: list[tuple[str, str]]) -> str:
+    """
+    Combine all 5 pre-filled prompts from one category into a single API call.
+
+    Args:
+        category:       Category name (e.g. "price_action").
+        filled_prompts: List of (prompt_key, filled_prompt_text) — already data-substituted.
+
+    Returns:
+        A single prompt string asking the LLM to return a JSON array of N objects,
+        one per analysis, in order.
+
+    Usage (orchestrator):
+        filled = [(key, template.format_map(data)) for key, template in prompts.items()]
+        bulk   = build_bulk_category_prompt(category, filled)
+        raw    = agent.fetch_data(bulk)   # returns list or dict
+    """
+    n = len(filled_prompts)
+    parts = [
+        f"You are an intraday trading analyst. Complete the {n} INDEPENDENT analyses below "
+        f"for the [{category.upper()}] category.\n"
+        f"Each analysis is self-contained — evaluate each one fully on its own merits.\n\n"
+        f"RESPONSE FORMAT — return ONLY a JSON array of exactly {n} objects in order:\n"
+        f"[<result_1>, <result_2>, ..., <result_{n}>]\n"
+        f"No text, explanation, or markdown outside the JSON array.\n",
+    ]
+    for i, (key, text) in enumerate(filled_prompts, 1):
+        parts.append(f"\n{'─'*52}")
+        parts.append(f"## Analysis {i}/{n}: {key}")
+        parts.append(text.strip())
+
+    parts.append(f"\n{'─'*52}")
+    parts.append(
+        f"Return a JSON array of exactly {n} objects "
+        f"(one per analysis, same order as above)."
+    )
+    return "\n".join(parts)
+
 # Category weights live in INTRADAY_PARAMS (single source of truth) so the backtest
 # tunes them in one place. This alias is kept for backward-compatible imports.
 INTRADAY_CATEGORY_WEIGHTS = INTRADAY_PARAMS["category_weights"]
