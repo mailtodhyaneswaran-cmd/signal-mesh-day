@@ -32,10 +32,19 @@ def get_eurusd_rate() -> float:
     Falls back to 1.08 if the fetch fails so position sizing never crashes.
     """
     try:
-        info = yf.Ticker("EURUSD=X").fast_info
-        rate = float(info.get("last_price") or info.get("regularMarketPrice") or 0)
-        if rate > 0:
-            return rate
+        fi   = yf.Ticker("EURUSD=X").fast_info
+        # fast_info is a FastInfo object (not a dict) — use getattr
+        rate = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
+        if rate and float(rate) > 0:
+            return float(rate)
+    except Exception:
+        pass
+    # Secondary fallback: download last close
+    try:
+        data = yf.download("EURUSD=X", period="2d", interval="1d",
+                           progress=False, auto_adjust=True)
+        if not data.empty:
+            return float(data["Close"].dropna().iloc[-1])
     except Exception:
         pass
     print("[ibkr_connector] EURUSD fetch failed — falling back to 1.08")

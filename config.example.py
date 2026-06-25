@@ -14,6 +14,11 @@ IBKR_CLIENT_ID = 36                                # keep different from candle-
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
 TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID"
 
+# ── AI agents ─────────────────────────────────────────────────────────────────
+# Claude uses the Claude Code CLI (no key needed — authenticated via CLI login).
+# Mistral API key from https://console.mistral.ai/api-keys
+MISTRAL_API_KEY = "YOUR_MISTRAL_API_KEY"
+
 # ── Capital & risk ────────────────────────────────────────────────────────────
 HOUSE_MONEY_EUR           = 5_000   # total deployable capital — never exceed principal
 RISK_PER_TRADE_PCT        = 0.01    # 1 % per trade ≈ €50
@@ -40,23 +45,26 @@ INTRADAY_PARAMS = SimpleNamespace(
     min_range_pct         = 0.0015,  # skip days where opening range < 0.15 % of price
     rvol_rolling_window   = 10,      # bars to look back for RVOL baseline
     poll_interval_sec     = 60,
+    breakout_window_end   = "16:30",  # NL time: no new breakout entries after this
 
     # ── Screener gates (Phase 1) ──────────────────────────────────────
     rvol_hard_floor       = 1.5,     # < this → hard NOTHING veto
+    rvol_full_conviction  = 3.0,     # >= this → full conviction (no cap)
     rvol_midtier_cap      = 60,      # conviction clamped here for 1.5–3× RVOL
-    gap_min_pct           = 0.5,     # minimum gap % to qualify
-    min_dollar_volume     = 50_000_000,
+    gap_min_pct           = 1.5,     # minimum |premarket gap| % to qualify
+    min_dollar_volume     = 20_000_000,
     shortlist_size        = 5,
     max_per_sector        = 2,
-    direction_threshold   = 0.3,     # net vote fraction to declare LONG/SHORT
+    direction_threshold   = 0.15,    # net weighted vote to declare LONG/SHORT
 
     # ── Screener category weights (Phase 1 — tune forward on paper only) ──
+    # Keys MUST match day_trading_prompts.ALL_INTRADAY_PROMPTS categories.
     category_weights = {
-        "momentum":      0.25,
-        "fundamentals":  0.20,
-        "sentiment":     0.20,
-        "macro":         0.15,
-        "quant":         0.20,
+        "price_action":   0.30,
+        "quant_edge":     0.25,
+        "catalyst":       0.20,
+        "sentiment_flow": 0.15,
+        "market_regime":  0.10,
     },
 
     # ── Cost model ────────────────────────────────────────────────────

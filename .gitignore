@@ -7,6 +7,10 @@ watchlist/*.json
 state.json
 *.log
 
+# cached IBKR bar data and backtest results
+data/
+results/
+
 # Python
 __pycache__/
 *.py[cod]

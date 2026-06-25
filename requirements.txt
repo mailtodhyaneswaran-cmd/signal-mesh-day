@@ -1,2 +1,4 @@
 ib_async
 yfinance
+mistralai
+lxml

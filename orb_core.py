@@ -58,23 +58,27 @@ class ORBConfig:
     min_range_pct:         float = 0.0015   # skip thin-range days
     slippage_pct:          float = 0.0002
     commission_per_share:  float = 0.005
+    # No new breakout entries after this NL time (too late for 2R before close).
+    # Set to "" to disable. 16:30 = 4:30 PM CEST per the 9:30 candle algorithm.
+    breakout_window_end:   str   = "16:30"
 
     @classmethod
     def from_params(cls, p) -> "ORBConfig":
         """Build from config.INTRADAY_PARAMS (SimpleNamespace)."""
         return cls(
-            range_minutes        = getattr(p, "orb_range_minutes",    5),
-            rvol_min             = getattr(p, "orb_rvol_gate",        1.5),
-            rvol_mode            = getattr(p, "rvol_mode",            "rolling"),
-            rvol_rolling_window  = getattr(p, "rvol_rolling_window",  10),
-            tp_r_multiple        = getattr(p, "tp_r_multiple",        2.0),
-            sl_mode              = getattr(p, "sl_mode",              "range_edge"),
-            atr_mult             = getattr(p, "atr_mult",             1.0),
-            require_retest       = getattr(p, "require_retest",       True),
-            retest_tolerance_pct = getattr(p, "retest_tolerance_pct", 0.0005),
-            min_range_pct        = getattr(p, "min_range_pct",        0.0015),
-            slippage_pct         = getattr(p, "slippage_pct",         0.0002),
-            commission_per_share = getattr(p, "commission_per_share", 0.005),
+            range_minutes        = getattr(p, "orb_range_minutes",     5),
+            rvol_min             = getattr(p, "orb_rvol_gate",         1.5),
+            rvol_mode            = getattr(p, "rvol_mode",             "rolling"),
+            rvol_rolling_window  = getattr(p, "rvol_rolling_window",   10),
+            tp_r_multiple        = getattr(p, "tp_r_multiple",         2.0),
+            sl_mode              = getattr(p, "sl_mode",               "range_edge"),
+            atr_mult             = getattr(p, "atr_mult",              1.0),
+            require_retest       = getattr(p, "require_retest",        True),
+            retest_tolerance_pct = getattr(p, "retest_tolerance_pct",  0.0005),
+            min_range_pct        = getattr(p, "min_range_pct",         0.0015),
+            slippage_pct         = getattr(p, "slippage_pct",          0.0002),
+            commission_per_share = getattr(p, "commission_per_share",  0.005),
+            breakout_window_end  = getattr(p, "breakout_window_end",   "16:30"),
         )
 
 
@@ -179,27 +183,31 @@ def detect_breakout(orng: OpeningRange, bar: Bar, direction: str) -> bool:
 def confirm_retest(orng: OpeningRange, bar: Bar, cfg: ORBConfig, direction: str) -> Optional[bool]:
     """Check whether a bar constitutes a valid retest of the breakout level.
 
+    Per the 9:30-candle algorithm:
+      LONG  — retest bar must touch orng.high (low <= high + tol)
+               close > orng.high → confirmed (True)
+               close <= orng.high → failed (False)  ← bar touched but closed back below the level
+      SHORT — retest bar must touch orng.low (high >= low - tol)
+               close < orng.low  → confirmed (True)
+               close >= orng.low → failed (False)
+
     Returns:
-        True   — valid retest (touched + rejected → enter trade)
-        False  — failed retest (price closed back inside range → skip day)
-        None   — no retest event on this bar yet
+        True   — valid retest → enter trade
+        False  — failed retest → skip the rest of the day
+        None   — no retest event on this bar yet (level not touched)
     """
     tol = cfg.retest_tolerance_pct * orng.mid
 
     if direction == "long":
-        touched   = bar.low   <= orng.high + tol
-        rejection = bar.close >  orng.high
-        failure   = bar.close <  orng.low
+        touched = bar.low  <= orng.high + tol
+        if touched:
+            return bar.close > orng.high   # True = confirmed, False = failed
     else:
-        touched   = bar.high  >= orng.low - tol
-        rejection = bar.close <  orng.low
-        failure   = bar.close >  orng.high
+        touched = bar.high >= orng.low - tol
+        if touched:
+            return bar.close < orng.low    # True = confirmed, False = failed
 
-    if touched and failure:
-        return False   # failed retest — abort the day
-    if touched and rejection:
-        return True    # confirmed retest — enter
-    return None        # nothing yet
+    return None  # level not yet touched on this bar
 
 
 def build_bracket(
@@ -282,14 +290,31 @@ def simulate_session(
                 print(f"      [{bar.t}] O:{bar.open:.2f} H:{bar.high:.2f} "
                       f"L:{bar.low:.2f} C:{bar.close:.2f} V:{bar.volume:.0f}")
 
-            if detect_breakout(orng, bar, bias):
+            # Breakout window: no new entries after cutoff (too late for 2R before close)
+            if cfg.breakout_window_end and bar.t >= cfg.breakout_window_end:
+                if verbose:
+                    print(f"      [{bar.t}] Breakout window closed ({cfg.breakout_window_end}) — standing aside")
+                continue
+
+            # "auto" = take whichever side breaks first (true ORB, no pre-set direction)
+            if bias == "auto":
+                if detect_breakout(orng, bar, "long"):
+                    candidate = "long"
+                elif detect_breakout(orng, bar, "short"):
+                    candidate = "short"
+                else:
+                    candidate = None
+            else:
+                candidate = bias if detect_breakout(orng, bar, bias) else None
+
+            if candidate is not None:
                 rv = rvol(global_idx, all_bars, opening_bars, cfg)
                 if rv >= cfg.rvol_min:
-                    direction_confirmed = bias
+                    direction_confirmed = candidate
                     breakout_idx        = i
                     rvol_at_break       = rv
                     if verbose:
-                        print(f"      → BREAKOUT {bias.upper()} RVOL={rv:.2f}x ✓")
+                        print(f"      → BREAKOUT {candidate.upper()} RVOL={rv:.2f}x ✓")
                 elif verbose:
                     print(f"      → breakout ignored — RVOL={rv:.2f}x < {cfg.rvol_min}x")
             continue
