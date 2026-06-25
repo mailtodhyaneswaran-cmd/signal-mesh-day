@@ -379,7 +379,8 @@ def run(
               f"catalyst: {data['catalyst_summary'][:60]}")
 
         # Round 1: 25 prompts × N agents
-        print(f"  Running 25 prompts × {len(agents)} agents...")
+        print(f"  Running 5 bulk category calls × {len(agents)} agents "
+              f"(25 analyses total)...")
         round1 = _run_round1(data, agents)
 
         # Cross-pollination
