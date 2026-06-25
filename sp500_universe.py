@@ -34,13 +34,26 @@ def get_sp500_tickers() -> list[str]:
 
 
 def _fetch_from_wikipedia() -> list[str]:
-    """Scrape the S&P 500 list from Wikipedia."""
+    """Scrape the S&P 500 list from Wikipedia.
+
+    Wikipedia blocks the default Python urllib User-Agent with HTTP 403.
+    We send a browser-like UA and pass the downloaded HTML to pd.read_html
+    so no browser or external dependency is needed.
+    """
+    import urllib.request
+    from io import StringIO
     import pandas as pd
-    print("[sp500] Fetching constituents from Wikipedia...")
-    tables = pd.read_html(
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        attrs={"id": "constituents"},
+
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; signal-mesh-day/1.0)"},
     )
+    print("[sp500] Fetching constituents from Wikipedia...")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8")
+
+    tables = pd.read_html(StringIO(html), attrs={"id": "constituents"})
     # Fix BRK.B → BRK-B etc. for yfinance compatibility
     tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
     print(f"[sp500] {len(tickers)} constituents loaded.")
