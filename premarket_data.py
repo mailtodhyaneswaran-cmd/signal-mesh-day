@@ -43,10 +43,11 @@ _PM_VOL_FRACTION = 0.05
 
 def fetch_market_context() -> dict:
     """
-    Fetch broad-market premarket context in one batch call:
-      SPY, QQQ — equity ETF pct change vs prior close
-      ES=F, NQ=F — futures pct change vs prior settle
-      ^VIX — level + 1-day change
+    Fetch broad-market premarket context.
+
+    SPY / QQQ: uses fast_info (last_price vs prior close) so it works premarket.
+    ES=F / NQ=F: daily close-to-close from yfinance download.
+    ^VIX: daily close-to-close.
 
     Returns a flat dict of string values ready for prompt .format_map().
     """
@@ -58,32 +59,50 @@ def fetch_market_context() -> dict:
         "vix":               "n/a",
         "vix_change":        "n/a",
     }
-    symbols = ["SPY", "QQQ", "ES=F", "NQ=F", "^VIX"]
+
+    # SPY and QQQ via fast_info — works premarket (last_price = current price)
+    for sym, key in [("SPY", "spy_premarket_pct"), ("QQQ", "qqq_premarket_pct")]:
+        try:
+            fi         = yf.Ticker(sym).fast_info
+            last       = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
+            prev_close = getattr(fi, "regular_market_previous_close", None)
+            if last and prev_close and float(prev_close) > 0:
+                pct = (float(last) - float(prev_close)) / float(prev_close) * 100
+                ctx[key] = f"{pct:+.2f}%"
+        except Exception:
+            pass
+
+    # ES/NQ futures and VIX via batch daily download
     try:
         raw = yf.download(
-            symbols, period="2d", interval="1d",
-            prepost=True, auto_adjust=True,
-            progress=False, threads=True,
+            ["ES=F", "NQ=F", "^VIX"], period="3d", interval="1d",
+            auto_adjust=True, progress=False, threads=True,
         )
-        closes = raw["Close"] if "Close" in raw.columns else raw.xs("Close", axis=1, level=0)
-
-        def _pct(sym: str) -> str:
+        if not raw.empty:
             try:
-                s = closes[sym].dropna()
-                return f"{(s.iloc[-1] / s.iloc[-2] - 1) * 100:+.2f}%" if len(s) >= 2 else "n/a"
-            except Exception:
-                return "n/a"
+                closes = raw["Close"]
+            except KeyError:
+                closes = raw.xs("Close", axis=1, level=0)
 
-        ctx["spy_premarket_pct"] = _pct("SPY")
-        ctx["qqq_premarket_pct"] = _pct("QQQ")
-        ctx["es_futures_pct"]    = _pct("ES=F")
-        ctx["nq_futures_pct"]    = _pct("NQ=F")
-        vix_s = closes["^VIX"].dropna()
-        if len(vix_s) >= 2:
-            ctx["vix"]        = f"{vix_s.iloc[-1]:.2f}"
-            ctx["vix_change"] = f"{(vix_s.iloc[-1] / vix_s.iloc[-2] - 1)*100:+.2f}%"
+            def _pct(sym: str) -> str:
+                try:
+                    s = closes[sym].dropna()
+                    return f"{(s.iloc[-1] / s.iloc[-2] - 1) * 100:+.2f}%" if len(s) >= 2 else "n/a"
+                except Exception:
+                    return "n/a"
+
+            ctx["es_futures_pct"] = _pct("ES=F")
+            ctx["nq_futures_pct"] = _pct("NQ=F")
+            try:
+                vix_s = closes["^VIX"].dropna()
+                if len(vix_s) >= 2:
+                    ctx["vix"]        = f"{vix_s.iloc[-1]:.2f}"
+                    ctx["vix_change"] = f"{(vix_s.iloc[-1] / vix_s.iloc[-2] - 1)*100:+.2f}%"
+            except Exception:
+                pass
     except Exception as e:
-        print(f"[premarket] market context error: {e}")
+        print(f"[premarket] futures/VIX context error: {e}")
+
     return ctx
 
 
@@ -230,31 +249,54 @@ def enrich_ticker(
     try:
         pm_bars = t.history(period="1d", interval="1m", prepost=True)
         if not pm_bars.empty:
-            # Keep bars before 09:30 ET
-            pm_only = pm_bars[
-                pm_bars.index.tz_convert("America/New_York").time
-                < pd.Timestamp("09:30").time()
-            ]
+            # Ensure tz-aware index before converting — yfinance may return naive timestamps
+            idx = pm_bars.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_et = idx.tz_convert("America/New_York")
+            import datetime as _dt
+            cutoff = _dt.time(9, 30)
+            pm_mask = [t_val.time() < cutoff for t_val in idx_et]
+            pm_only = pm_bars[pm_mask]
             if not pm_only.empty:
                 pm_price  = round(float(pm_only["Close"].iloc[-1]), 4)
                 pm_high   = round(float(pm_only["High"].max()), 4)
                 pm_low    = round(float(pm_only["Low"].min()), 4)
                 pm_volume = int(pm_only["Volume"].sum())
     except Exception as e:
-        print(f"  [{ticker}] premarket bars error: {e}")
+        print(f"  [{ticker}] premarket 1-min bars error: {e}")
 
-    # Fallback: fast_info for current price
+    # Fallback 1: fast_info current price + intraday volume (includes premarket)
+    fi = t.fast_info
     if pm_price == prior_close:
         try:
-            pm_price = round(float(yf.Ticker(ticker).fast_info.last_price or prior_close), 4)
-            pm_high  = pm_price
-            pm_low   = pm_price
+            last = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
+            if last and float(last) > 0:
+                pm_price = round(float(last), 4)
+                pm_high  = pm_price
+                pm_low   = pm_price
+        except Exception:
+            pass
+
+    if pm_volume == 0:
+        try:
+            intraday_vol = getattr(fi, "regular_market_volume", None)
+            if intraday_vol and int(intraday_vol) > 0:
+                pm_volume = int(intraday_vol)
+                print(f"  [{ticker}] premarket 1-min unavailable — using fast_info volume ({pm_volume:,})")
         except Exception:
             pass
 
     gap_pct             = round((pm_price - prior_close) / prior_close * 100, 2) if prior_close else 0.0
     avg_pm_vol_estimate = avg_daily_volume * _PM_VOL_FRACTION
-    rvol_premarket      = round(pm_volume / avg_pm_vol_estimate, 2) if avg_pm_vol_estimate > 0 else 0.0
+
+    if pm_volume > 0 and avg_pm_vol_estimate > 0:
+        rvol_premarket = round(pm_volume / avg_pm_vol_estimate, 2)
+    else:
+        # Volume data unavailable — use floor value so prompts can run with capped conviction.
+        # QE1 prompt is told to lower conviction when volume data is absent.
+        rvol_premarket = float(getattr(params, "rvol_hard_floor", 1.5))
+        print(f"  [{ticker}] premarket volume unavailable — RVOL defaulting to {rvol_premarket}x (floor)")
 
     # ── Ticker info: float, sector, earnings ─────────────────────────────
     float_shares = short_pct = 0.0
