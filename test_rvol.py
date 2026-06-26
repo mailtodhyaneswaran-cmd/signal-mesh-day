@@ -74,7 +74,9 @@ def run(ticker: str, run_ai: bool = False, verbose: bool = False) -> bool:
         if today_pm_vol > 0:
             print(f"  Today's premarket volume: {today_pm_vol:,} shares")
         else:
-            print(f"  Today's premarket volume: 0  (market not open / premarket ended?)")
+            print(f"  Today's premarket volume: 0")
+            print(f"  Note: Step 2 only returns data during US premarket hours")
+            print(f"        (04:00–09:30 ET = 10:00–15:30 NL). Run then for live RVOL.")
     except Exception as e:
         print(f"  Error: {e}")
         today_pm_vol = 0

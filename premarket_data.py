@@ -18,6 +18,7 @@ import pandas as pd
 import yfinance as yf
 
 import config
+import ibkr_connector
 
 # Sector → ETF mapping for sector_premarket_pct prompt field
 SECTOR_ETF_MAP = {
