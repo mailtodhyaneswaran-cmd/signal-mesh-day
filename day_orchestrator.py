@@ -233,9 +233,26 @@ def _run_cross_pollination(
 # ── Aggregation ───────────────────────────────────────────────────────────────
 
 def _aggregate(round1: dict[str, list[dict]], rvol: float) -> dict:
-    """Flatten all round-1 prompt results and call aggregate_ticker."""
-    all_results = [r for results in round1.values() for r in results]
-    return aggregate_ticker(all_results, rvol, _DTP_PARAMS)
+    """
+    Aggregate round-1 results per-agent, then average the nets.
+
+    Flattening 50 results (2 agents × 25) before thresholding doubles the
+    net score relative to the calibrated direction_threshold. Averaging
+    per-agent nets keeps the scale agent-count-independent.
+    """
+    agent_nets = []
+    for results in round1.values():
+        agg = aggregate_ticker(results, rvol, _DTP_PARAMS)
+        if not agg.get("rvol_veto"):
+            agent_nets.append(agg["net"])
+
+    if not agent_nets:
+        return {"direction": "NOTHING", "net": 0.0, "rvol_veto": True}
+
+    avg_net   = round(sum(agent_nets) / len(agent_nets), 4)
+    thr       = _DTP_PARAMS["direction_threshold"]
+    direction = "LONG" if avg_net >= thr else "SHORT" if avg_net <= -thr else "NOTHING"
+    return {"direction": direction, "net": avg_net, "rvol_veto": False}
 
 
 # ── Watchlist writer ──────────────────────────────────────────────────────────
@@ -391,16 +408,31 @@ def run(
               f"(25 analyses total)...")
         round1 = _run_round1(data, agents)
 
-        # Cross-pollination
+        # Cross-pollination — capture revised signals
         print(f"  Cross-pollination...")
-        _run_cross_pollination(data, round1, agents)
+        revised = _run_cross_pollination(data, round1, agents)
 
-        # Aggregate
+        # Aggregate round-1 (per-agent average net)
         agg       = _aggregate(round1, rvol)
         direction = agg["direction"]   # "LONG" | "SHORT" | "NOTHING"
         net       = agg["net"]
-        # Conviction: scale |net| against max possible (0.5 is a strong signal)
-        conviction = min(abs(net) / 0.5, 1.0)
+
+        # Cross-poll consensus override: if ALL agents revised to NOTHING,
+        # the deliberation vetoed the round-1 signal — trust it.
+        cp_signals = [
+            r.get("revised_signal", direction)
+            for r in revised.values()
+            if "error" not in r
+        ]
+        if cp_signals and direction != "NOTHING" and all(s == "NOTHING" for s in cp_signals):
+            print(f"  ⚠️  Cross-poll consensus: all agents revised to NOTHING "
+                  f"(overrides round-1 {direction})")
+            direction = "NOTHING"
+            net       = 0.0
+
+        # Conviction: 0% at threshold, 100% at 2× threshold and above
+        thr        = _DTP_PARAMS["direction_threshold"]
+        conviction = min(max(abs(net) - thr, 0) / thr, 1.0) if thr > 0 else 0.0
 
         print(f"  → {direction}  net={net:+.4f}  conviction={conviction:.0%}")
         _tg_ticker_result(ticker, direction, conviction, net, rvol,
