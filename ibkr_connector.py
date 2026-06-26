@@ -6,6 +6,11 @@ Key additions vs the reference:
   - get_eurusd_rate()  — live EUR→USD conversion for position sizing
   - get_contract() accepts a pre-qualified contract or builds one from symbol
 """
+import datetime as _dt
+import json as _json
+from collections import defaultdict as _defaultdict
+from pathlib import Path as _Path
+
 import yfinance as yf
 from zoneinfo import ZoneInfo
 
@@ -14,6 +19,10 @@ from ib_async import IB, Stock, LimitOrder, MarketOrder, StopOrder
 import config
 
 NL = ZoneInfo("Europe/Amsterdam")
+_ET = ZoneInfo("America/New_York")
+
+# Disk cache for avg premarket volume (keyed by symbol + date + lookback days)
+_RVOL_CACHE_DIR = _Path("watchlist/.rvol_cache")
 
 
 def connect() -> IB:
@@ -77,9 +86,12 @@ def get_latest_closed_1min_bar(ib: IB, contract: Stock):
 
 
 def get_rvol(ib: IB, contract: Stock, current_volume: float) -> float:
-    """Relative Volume vs median of last 10 closed 1-min bars.
+    """Intraday RVOL: current 1-min bar volume vs median of last 10 closed bars.
 
-    Returns 1.0 on failure (neutral — won't block a trade but logs clearly).
+    Used at BREAKOUT DETECTION time (Phase 2 / orb_strategy.py).
+    This is DIFFERENT from premarket RVOL (Phase 1 screener) — see
+    get_premarket_volume_ibkr() and get_avg_premarket_volume_ibkr().
+    Returns 1.0 on failure (neutral — passes the gate but logs clearly).
     """
     bars = ib.reqHistoricalData(
         contract, endDateTime="", durationStr="1800 S",
@@ -92,6 +104,94 @@ def get_rvol(ib: IB, contract: Stock, current_volume: float) -> float:
     import statistics
     avg = statistics.median(recent_vols)
     return current_volume / avg if avg > 0 else 1.0
+
+
+def get_premarket_volume_ibkr(ib: IB, contract: Stock) -> int:
+    """Sum of 1-min bar volumes from 04:00 to 09:30 ET today.
+
+    Uses useRTH=False so premarket bars are included.
+    Returns 0 on failure.
+    """
+    try:
+        bars = ib.reqHistoricalData(
+            contract, endDateTime="", durationStr="23400 S",
+            barSizeSetting="1 min", whatToShow="TRADES",
+            useRTH=False, formatDate=1,
+        )
+        pm_open   = _dt.time(4, 0)
+        pm_cutoff = _dt.time(9, 30)
+        total = 0
+        for bar in bars:
+            t = bar.date.astimezone(_ET).time()
+            if pm_open <= t < pm_cutoff:
+                total += bar.volume
+        return total
+    except Exception as e:
+        print(f"[ibkr_connector] get_premarket_volume_ibkr failed: {e}")
+        return 0
+
+
+def get_avg_premarket_volume_ibkr(
+    ib:            IB,
+    contract:      Stock,
+    lookback_days: int = 20,
+) -> float:
+    """Average premarket volume (04:00–09:30 ET) over the last lookback_days trading days.
+
+    Disk-cached per (symbol, date, lookback_days) so repeated screener runs on the
+    same day skip the IBKR request entirely.
+    """
+    _RVOL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    today      = _dt.date.today().isoformat()
+    cache_file = _RVOL_CACHE_DIR / f"{contract.symbol}_{today}_{lookback_days}d.json"
+
+    if cache_file.exists():
+        try:
+            return float(_json.loads(cache_file.read_text())["avg_pm_vol"])
+        except Exception:
+            pass
+
+    avg = _compute_avg_premarket_volume(ib, contract, lookback_days)
+
+    try:
+        cache_file.write_text(_json.dumps({"avg_pm_vol": avg}))
+    except Exception:
+        pass
+
+    return avg
+
+
+def _compute_avg_premarket_volume(
+    ib:            IB,
+    contract:      Stock,
+    lookback_days: int,
+) -> float:
+    """Fetch lookback_days×2 calendar days of 1-min bars and compute avg daily premarket vol."""
+    try:
+        bars = ib.reqHistoricalData(
+            contract, endDateTime="", durationStr=f"{lookback_days * 2} D",
+            barSizeSetting="1 min", whatToShow="TRADES",
+            useRTH=False, formatDate=1,
+        )
+        pm_open   = _dt.time(4, 0)
+        pm_cutoff = _dt.time(9, 30)
+
+        daily_volumes: _defaultdict = _defaultdict(int)
+        for bar in bars:
+            bar_et = bar.date.astimezone(_ET)
+            t      = bar_et.time()
+            if pm_open <= t < pm_cutoff:
+                daily_volumes[bar_et.date()] += bar.volume
+
+        if not daily_volumes:
+            return 0.0
+
+        sorted_days = sorted(daily_volumes.keys())[-lookback_days:]
+        vols = [daily_volumes[d] for d in sorted_days if daily_volumes[d] > 0]
+        return sum(vols) / len(vols) if vols else 0.0
+    except Exception as e:
+        print(f"[ibkr_connector] _compute_avg_premarket_volume failed: {e}")
+        return 0.0
 
 
 def place_bracket_order(ib: IB, contract: Stock, action: str, qty: int,

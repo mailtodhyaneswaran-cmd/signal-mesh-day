@@ -48,6 +48,7 @@ INTRADAY_PARAMS = SimpleNamespace(
     breakout_window_end   = "16:30",  # NL time: no new breakout entries after this
 
     # ── Screener gates (Phase 1) ──────────────────────────────────────
+    rvol_lookback_days    = 20,      # days of premarket history for RVOL baseline (IBKR)
     rvol_hard_floor       = 1.5,     # < this → hard NOTHING veto
     rvol_full_conviction  = 3.0,     # >= this → full conviction (no cap)
     rvol_midtier_cap      = 60,      # conviction clamped here for 1.5–3× RVOL

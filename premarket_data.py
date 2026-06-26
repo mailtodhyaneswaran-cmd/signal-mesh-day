@@ -211,10 +211,15 @@ def enrich_ticker(
     candidates: list[dict],
     eurusd:     float,
     params,
+    ib=None,
 ) -> dict:
     """
     Full data enrichment for one shortlisted ticker.
     Populates every field required by the 25 day-trading prompts.
+
+    ib: optional live IBKR connection. When provided, real premarket RVOL
+        is computed from IBKR 1-min bars (useRTH=False) instead of the
+        yfinance fallback estimate.
     """
     t = yf.Ticker(ticker)
 
@@ -288,15 +293,39 @@ def enrich_ticker(
             pass
 
     gap_pct             = round((pm_price - prior_close) / prior_close * 100, 2) if prior_close else 0.0
-    avg_pm_vol_estimate = avg_daily_volume * _PM_VOL_FRACTION
+    avg_pm_vol_estimate = avg_daily_volume * _PM_VOL_FRACTION   # yfinance fallback only
 
-    if pm_volume > 0 and avg_pm_vol_estimate > 0:
-        rvol_premarket = round(pm_volume / avg_pm_vol_estimate, 2)
-    else:
-        # Volume data unavailable — use floor value so prompts can run with capped conviction.
-        # QE1 prompt is told to lower conviction when volume data is absent.
-        rvol_premarket = float(getattr(params, "rvol_hard_floor", 1.5))
-        print(f"  [{ticker}] premarket volume unavailable — RVOL defaulting to {rvol_premarket}x (floor)")
+    # ── Real RVOL via IBKR premarket 1-min bars ───────────────────────────
+    # Formula: today's premarket vol (04:00–09:30 ET, useRTH=False)
+    #          ÷ avg premarket vol same window over last 20 days
+    # This is apples-to-apples. The × 0.05 estimate is only used as a last resort.
+    rvol_premarket = 0.0
+    if ib is not None:
+        try:
+            contract_ibkr     = ibkr_connector.get_contract(ticker)
+            real_pm_volume    = ibkr_connector.get_premarket_volume_ibkr(ib, contract_ibkr)
+            avg_pm_volume_20d = ibkr_connector.get_avg_premarket_volume_ibkr(
+                ib, contract_ibkr,
+                lookback_days=getattr(params, "rvol_lookback_days", 20),
+            )
+            if real_pm_volume > 0 and avg_pm_volume_20d > 0:
+                rvol_premarket = round(real_pm_volume / avg_pm_volume_20d, 2)
+                pm_volume      = real_pm_volume
+                print(f"  [{ticker}] Real RVOL {rvol_premarket}x  "
+                      f"(today {real_pm_volume:,}  avg20d {avg_pm_volume_20d:,.0f})")
+            else:
+                print(f"  [{ticker}] IBKR premarket bars returned no volume — using fallback")
+        except Exception as e:
+            print(f"  [{ticker}] IBKR RVOL error: {e}")
+
+    # Fallback chain: yfinance intraday vol ÷ 5% estimate → hard floor
+    if rvol_premarket == 0.0:
+        if pm_volume > 0 and avg_pm_vol_estimate > 0:
+            rvol_premarket = round(pm_volume / avg_pm_vol_estimate, 2)
+            print(f"  [{ticker}] Estimated RVOL {rvol_premarket}x (yfinance / ×0.05 fallback)")
+        else:
+            rvol_premarket = float(getattr(params, "rvol_hard_floor", 1.5))
+            print(f"  [{ticker}] Premarket volume unavailable — RVOL floor {rvol_premarket}x")
 
     # ── Ticker info: float, sector, earnings ─────────────────────────────
     float_shares = short_pct = 0.0

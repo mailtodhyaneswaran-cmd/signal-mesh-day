@@ -355,6 +355,14 @@ def run(
     _tg_shortlist(candidates)
     print(f"\n  Shortlist: {', '.join(c['ticker'] for c in candidates)}\n")
 
+    # ── IBKR connection for real premarket RVOL ────────────────────────────
+    ib_screener = None
+    try:
+        ib_screener = ibkr_connector.connect()
+        print("  IBKR connected for real premarket RVOL\n")
+    except Exception as e:
+        print(f"  IBKR unavailable ({e}) — RVOL will use yfinance estimate\n")
+
     # ── Per-ticker mesh ────────────────────────────────────────────────────
     picks: list[dict] = []
 
@@ -362,9 +370,9 @@ def run(
         ticker = cand["ticker"]
         print(f"  ── [{i}/{len(candidates)}] {ticker} {'─'*42}")
 
-        # Full data enrichment
+        # Full data enrichment (real RVOL from IBKR when connected)
         print(f"  Enriching premarket data...")
-        data = enrich_ticker(ticker, mkt_ctx, candidates, eurusd, params)
+        data = enrich_ticker(ticker, mkt_ctx, candidates, eurusd, params, ib=ib_screener)
         rvol = float(data.get("rvol_premarket", 0))
 
         # Hard RVOL veto before running expensive prompts
@@ -417,6 +425,13 @@ def run(
             "last_price":       float(data.get("premarket_price") or 0),
             "sector":           data.get("sector", ""),
         })
+
+    # ── Disconnect IBKR screener connection ───────────────────────────────
+    if ib_screener is not None:
+        try:
+            ib_screener.disconnect()
+        except Exception:
+            pass
 
     # ── Sort by confidence, keep top MAX_CONCURRENT_POSITIONS ─────────────
     picks.sort(key=lambda x: x["confidence"], reverse=True)
