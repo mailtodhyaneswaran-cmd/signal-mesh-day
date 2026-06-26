@@ -1,8 +1,14 @@
 """
 data_loader.py — IBKR 1-min bar fetcher with local CSV cache.
 
-Cache layout:  data/{TICKER}/{YYYY-MM-DD}.csv
-Each CSV has a header: t,open,high,low,close,volume  (RTH bars only)
+Cache layout
+────────────
+  data/{TICKER}/{YYYY-MM-DD}.csv      RTH bars  (09:30–16:00 ET, useRTH=True)
+  data/{TICKER}/{YYYY-MM-DD}_pm.csv   Premarket  (04:00–09:30 ET, useRTH=False)
+
+Both share the same CSV schema: t,open,high,low,close,volume
+Bar times are stored in NL (Europe/Amsterdam) timezone.  NL is always 6 h ahead
+of New York, so premarket bars span 10:00–15:30 NL.
 
 IBKR pacing limits: ~60 historical requests per 10 min.
   - _fetch_from_ibkr sleeps PACING_SLEEP_SEC after each live fetch.
@@ -26,6 +32,9 @@ BULK_PAUSE_SEC   = 650         # ~10 min 50 s — resets the IBKR pacing window
 
 def _cache_path(ticker: str, d: date) -> Path:
     return CACHE_DIR / ticker / f"{d.isoformat()}.csv"
+
+def _pm_cache_path(ticker: str, d: date) -> Path:
+    return CACHE_DIR / ticker / f"{d.isoformat()}_pm.csv"
 
 
 def _save_bars(bars: list[Bar], path: Path) -> None:
@@ -109,6 +118,72 @@ def load_session(ticker: str, session_date: date, ib=None) -> list[Bar]:
     bars = _fetch_from_ibkr(ib, ticker, session_date)
     if bars:
         _save_bars(bars, path)
+    return bars
+
+
+def load_premarket_session(ticker: str, session_date: date, ib=None) -> list[Bar]:
+    """Return premarket 1-min bars (04:00–09:30 ET) for ticker on session_date.
+
+    Cache: data/{ticker}/{date}_pm.csv — same format as RTH cache.
+    Loads from cache when available; fetches from IBKR (useRTH=False) otherwise.
+    Returns [] on failure or when no connection is available.
+    """
+    path = _pm_cache_path(ticker, session_date)
+    if path.exists():
+        return _load_bars_csv(path)
+    if ib is None:
+        return []
+    bars = _fetch_premarket_from_ibkr(ib, ticker, session_date)
+    if bars:
+        _save_bars(bars, path)
+    return bars
+
+
+def _fetch_premarket_from_ibkr(ib, ticker: str, d: date) -> list[Bar]:
+    """Fetch premarket 1-min bars for one date via IBKR (useRTH=False).
+
+    NL is always 6 h ahead of New York, so:
+      04:00 ET = 10:00 NL (premarket open)
+      09:30 ET = 15:30 NL (regular session open)
+    endDateTime "15:30:00" NL = exactly the premarket close for any date.
+    durationStr "23400 S" = 6.5 h → covers from 09:00 NL (03:00 ET) to 15:30 NL.
+    """
+    from zoneinfo import ZoneInfo
+    import ibkr_connector
+
+    NL       = ZoneInfo("Europe/Amsterdam")
+    contract = ibkr_connector.get_contract(ticker)
+    end_dt   = f"{d.strftime('%Y%m%d')} 15:30:00"   # 09:30 ET in NL time
+
+    try:
+        raw = ib.reqHistoricalData(
+            contract,
+            endDateTime    = end_dt,
+            durationStr    = "23400 S",
+            barSizeSetting = "1 min",
+            whatToShow     = "TRADES",
+            useRTH         = False,        # include premarket bars
+            formatDate     = 1,
+        )
+    except Exception as e:
+        print(f"  [data_loader] premarket fetch failed {ticker} {d}: {e}")
+        time.sleep(PACING_SLEEP_SEC)
+        return []
+
+    bars = []
+    for b in raw:
+        t_nl = b.date.astimezone(NL).strftime("%H:%M")
+        # 10:00–15:30 NL = 04:00–09:30 ET (premarket window)
+        if "10:00" <= t_nl < "15:30":
+            bars.append(Bar(
+                t      = t_nl,
+                open   = b.open,
+                high   = b.high,
+                low    = b.low,
+                close  = b.close,
+                volume = float(b.volume),
+            ))
+    time.sleep(PACING_SLEEP_SEC)
     return bars
 
 

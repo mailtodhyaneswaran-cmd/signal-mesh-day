@@ -166,32 +166,36 @@ def _compute_avg_premarket_volume(
     contract:      Stock,
     lookback_days: int,
 ) -> float:
-    """Fetch lookback_days×2 calendar days of 1-min bars and compute avg daily premarket vol."""
-    try:
-        bars = ib.reqHistoricalData(
-            contract, endDateTime="", durationStr=f"{lookback_days * 2} D",
-            barSizeSetting="1 min", whatToShow="TRADES",
-            useRTH=False, formatDate=1,
-        )
-        pm_open   = _dt.time(4, 0)
-        pm_cutoff = _dt.time(9, 30)
+    """Average premarket volume using data_loader's per-day cached CSV files.
 
-        daily_volumes: _defaultdict = _defaultdict(int)
-        for bar in bars:
-            bar_et = bar.date.astimezone(_ET)
-            t      = bar_et.time()
-            if pm_open <= t < pm_cutoff:
-                daily_volumes[bar_et.date()] += bar.volume
+    For each of the last lookback_days trading days, loads premarket bars from
+    data/{symbol}/{date}_pm.csv (cached by load_premarket_session). Cache misses
+    trigger a single-day IBKR fetch (useRTH=False) which is then saved, so
+    subsequent screener runs need no live IBKR connection for the baseline.
+    """
+    import data_loader
+    from datetime import timedelta
 
-        if not daily_volumes:
-            return 0.0
+    today = _dt.date.today()
+    days: list[_dt.date] = []
+    d = today - timedelta(days=1)
+    while len(days) < lookback_days:
+        if d.weekday() < 5:   # Mon–Fri only
+            days.append(d)
+        d -= timedelta(days=1)
 
-        sorted_days = sorted(daily_volumes.keys())[-lookback_days:]
-        vols = [daily_volumes[d] for d in sorted_days if daily_volumes[d] > 0]
-        return sum(vols) / len(vols) if vols else 0.0
-    except Exception as e:
-        print(f"[ibkr_connector] _compute_avg_premarket_volume failed: {e}")
+    daily_vols = []
+    for day in days:
+        bars = data_loader.load_premarket_session(contract.symbol, day, ib)
+        if bars:
+            vol = sum(b.volume for b in bars)
+            if vol > 0:
+                daily_vols.append(vol)
+
+    if not daily_vols:
         return 0.0
+
+    return sum(daily_vols) / len(daily_vols)
 
 
 def place_bracket_order(ib: IB, contract: Stock, action: str, qty: int,
