@@ -10,11 +10,13 @@ state.json
 dat/state.json
 *.log
 
-# cached IBKR bar data and backtest results
+# cached IBKR bar data, backtest results, RVOL cache
 data/
 dat/data/
 results/
 dat/results/
+dat/watchlist/.rvol_cache/
+.rvol_cache/
 
 # Python
 __pycache__/
@@ -26,3 +28,7 @@ __pycache__/
 .vscode/
 .idea/
 *.code-workspace
+
+# Local session notes (not for version control)
+HISTORY.md
+dat/todo.md
