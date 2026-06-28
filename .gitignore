@@ -1,15 +1,20 @@
 # credentials
 .env
 config.py
+dat/config.py
 
 # runtime outputs
 watchlist/*.json
+dat/watchlist/*.json
 state.json
+dat/state.json
 *.log
 
 # cached IBKR bar data and backtest results
 data/
+dat/data/
 results/
+dat/results/
 
 # Python
 __pycache__/
