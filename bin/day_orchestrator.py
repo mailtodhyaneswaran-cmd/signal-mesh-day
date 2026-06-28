@@ -65,7 +65,16 @@ class _SafeDict(dict):
 
 # ── Agent initialisation ──────────────────────────────────────────────────────
 
-def _build_agents(verbose: bool) -> dict:
+def _build_agents(verbose: bool, mock: bool = False) -> dict:
+    if mock:
+        from mock_responses import MockAgent
+        agents = {
+            "mock_claude":  MockAgent("mock_claude",  verbose=verbose),
+            "mock_mistral": MockAgent("mock_mistral", verbose=verbose),
+        }
+        print("  [MOCK] Simulated agents — no API calls")
+        return agents
+
     agents = {}
     try:
         agents["claude"] = ClaudeAgent(verbose=verbose)
@@ -322,6 +331,7 @@ def _tg_watchlist_summary(picks: list[dict]) -> None:
 def run(
     tickers_override: list[str] | None = None,
     verbose: bool = False,
+    mock: bool = False,
 ) -> list[dict]:
     """
     Full Phase 1 orchestration. Returns the picks list written to the watchlist.
@@ -346,7 +356,7 @@ def run(
 
     # ── AI agents ──────────────────────────────────────────────────────────
     print("  Initialising AI agents...")
-    agents = _build_agents(verbose)
+    agents = _build_agents(verbose, mock=mock)
 
     # ── Market context ─────────────────────────────────────────────────────
     print("\n  Fetching market context...")
@@ -510,8 +520,10 @@ def main() -> None:
                    help="Bypass screener, analyse these tickers")
     p.add_argument("--verbose", action="store_true",
                    help="Print every prompt and AI response")
+    p.add_argument("--mock", action="store_true",
+                   help="Use simulated agents (no API calls) for fast logic testing")
     args = p.parse_args()
-    run(tickers_override=args.tickers, verbose=args.verbose)
+    run(tickers_override=args.tickers, verbose=args.verbose, mock=args.mock)
 
 
 if __name__ == "__main__":
