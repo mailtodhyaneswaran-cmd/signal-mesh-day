@@ -5,21 +5,17 @@ Implements Strategy (strategy_base.py) and the full session runner that
 loads watchlist_YYYYMMDD.json, gates direction per the mesh signal, and
 executes ORB via orb_core primitives through ibkr_connector.
 
-Signal → Direction mapping (from todo.md):
+Signal → Direction mapping:
   BUY  → long  (upside breakout only)
   SELL → short (downside breakout only)
   HOLD → skip
 
 Run via Task Scheduler at ~15:25 NL:
   python orb_strategy.py
-
-Phase 2 TODO:
-  - [ ] Multi-ticker concurrent monitoring (threading per pick)
-  - [ ] Per-day state.json tracking (MAX_TRADES_PER_SYMBOL_PER_DAY gate)
-  - [ ] Hard EOD flatten for all open positions
 """
 import json
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -164,8 +160,13 @@ def _save_state(state: dict) -> None:
 
 # ── Session runner (single ticker) ───────────────────────────────────────────
 
-def run_ticker(pick: dict, ib, state: dict) -> None:
-    """Run the full ORB session for one watchlist pick."""
+def run_ticker(
+    pick:       dict,
+    ib,
+    state:      dict,
+    state_lock: threading.Lock,
+) -> None:
+    """Run the full ORB session for one watchlist pick (runs in its own thread)."""
     ticker    = pick["ticker"]
     signal    = pick.get("signal", "HOLD")
     direction = _SIGNAL_TO_DIRECTION.get(signal, "skip")
@@ -177,9 +178,11 @@ def run_ticker(pick: dict, ib, state: dict) -> None:
         send_message(f"😴 {ticker} — HOLD signal, skipping ORB today.")
         return
 
-    if state["trades"].get(ticker):
-        print(f"{ticker}: trade already taken today — skipping.")
-        return
+    # Thread-safe MAX_TRADES_PER_SYMBOL_PER_DAY gate
+    with state_lock:
+        if state["trades"].get(ticker):
+            print(f"{ticker}: trade already taken today — skipping.")
+            return
 
     send_message(
         f"🔔 Watching <b>{ticker}</b> for ORB  ·  bias: {direction.upper()}\n"
@@ -284,8 +287,9 @@ def run_ticker(pick: dict, ib, state: dict) -> None:
                     f"TP {bracket['take_profit']:.2f}  qty {bracket['qty']}  "
                     f"exposure ${bracket['entry'] * bracket['qty']:.0f}"
                 )
-                state["trades"][ticker] = True
-                _save_state(state)
+                with state_lock:
+                    state["trades"][ticker] = True
+                    _save_state(state)
                 _monitor_bracket(ib, contract, trades, direction_confirmed,
                                  bracket, orng, ticker, currency, session_end)
                 return
@@ -338,6 +342,35 @@ def _monitor_bracket(ib, contract, trades, direction, bracket, orng,
     send_message(f"⏰ {ticker} EOD flatten — position closed at market.")
 
 
+# ── EOD safety net ───────────────────────────────────────────────────────────
+
+def _eod_safety_flatten(ib, actionable: list) -> None:
+    """Close any positions still open after all ticker threads have finished.
+
+    Catches the edge case where a thread raised an unhandled exception after
+    placing a bracket but before the EOD flatten inside _monitor_bracket ran.
+    """
+    try:
+        ib.sleep(2)
+        positions = ib.positions()
+        watchlist = {p["ticker"] for p in actionable}
+        closed = 0
+        for pos in positions:
+            sym = pos.contract.symbol
+            if sym in watchlist and pos.position != 0:
+                direction = "long" if pos.position > 0 else "short"
+                qty = abs(int(pos.position))
+                ibkr_connector.close_position_at_market(
+                    ib, pos.contract, direction, qty
+                )
+                send_message(f"⏰ EOD safety flatten: {sym}  qty={qty}")
+                closed += 1
+        if closed == 0:
+            print("  EOD safety check: no open positions.")
+    except Exception as e:
+        print(f"[EOD safety flatten] {e}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -371,11 +404,29 @@ def main() -> None:
         print(msg); send_message(msg)
         return
 
-    state = _load_state()
+    state      = _load_state()
+    state_lock = threading.Lock()
 
-    # Phase 2 TODO: run tickers concurrently (threading)
+    # Spawn one thread per pick — all tickers monitored concurrently
+    threads: list[threading.Thread] = []
     for pick in actionable[:config.MAX_CONCURRENT_POSITIONS]:
-        run_ticker(pick, ib, state)
+        t = threading.Thread(
+            target = run_ticker,
+            args   = (pick, ib, state, state_lock),
+            name   = f"orb-{pick['ticker']}",
+            daemon = True,
+        )
+        t.start()
+        threads.append(t)
+        print(f"  [{pick['ticker']}] thread started")
+
+    # Wait for every ticker thread to finish
+    for t in threads:
+        t.join()
+
+    # Hard EOD safety net — close anything still open (unhandled thread crash)
+    print("\n  Running EOD safety flatten check...")
+    _eod_safety_flatten(ib, actionable)
 
     ib.disconnect()
     send_message("✅ ORB session complete — all positions flat.")
