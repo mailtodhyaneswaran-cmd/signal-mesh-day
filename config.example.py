@@ -68,6 +68,16 @@ INTRADAY_PARAMS = SimpleNamespace(
         "market_regime":  0.10,
     },
 
+    # ── IB strategy (60-min Initial Balance breakout) ────────────────
+    ib_range_minutes      = 60,    # IB range = first 60 min of session
+
+    # ── VWAP strategy (mean-reversion) ───────────────────────────────
+    vwap_min_deviation    = 0.015, # 1.5 % from VWAP to trigger entry
+    vwap_tp_r_multiple    = 1.5,   # TP = 1.5R (more conservative than ORB's 2R)
+    vwap_require_reversal = True,  # wait for bar closing back toward VWAP
+    vwap_warmup_bars      = 15,    # bars before looking for trades
+    vwap_stop_atr_mult    = 1.0,   # stop distance = 1× bar ATR
+
     # ── Cost model ────────────────────────────────────────────────────
     slippage_pct          = 0.0002,
     commission_per_share  = 0.005,

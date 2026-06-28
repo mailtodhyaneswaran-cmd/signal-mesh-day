@@ -45,6 +45,7 @@ from day_trading_prompts import (
 )
 from sp500_universe import get_sp500_tickers
 from premarket_data import fetch_market_context, batch_gap_scan, enrich_ticker
+from regime import pick_strategy, FALLBACK_WINDOW_NL
 from lib_agents_claude import ClaudeAgent
 from lib_agents_mistral import MistralAgent
 
@@ -257,7 +258,7 @@ def _aggregate(round1: dict[str, list[dict]], rvol: float) -> dict:
 
 # ── Watchlist writer ──────────────────────────────────────────────────────────
 
-def _write_watchlist(picks: list[dict], eurusd: float) -> Path:
+def _write_watchlist(picks: list[dict], eurusd: float, strategy: str = "ORB") -> Path:
     """Write watchlist_YYYYMMDD.json per Appendix A schema."""
     today     = datetime.now(NL).strftime("%Y%m%d")
     now_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -266,6 +267,8 @@ def _write_watchlist(picks: list[dict], eurusd: float) -> Path:
     doc = {
         "date":             datetime.now(NL).strftime("%Y-%m-%d"),
         "generated_at_utc": now_utc,
+        "strategy":         strategy,       # "ORB" | "IB" | "VWAP" | "SIT_OUT"
+        "fallback_window":  FALLBACK_WINDOW_NL.get(strategy, ""),
         "eur_usd_rate":     eurusd,
         "house_money_eur":  config.HOUSE_MONEY_EUR,
         "usd_budget":       usd_budget,
@@ -465,12 +468,31 @@ def run(
         except Exception:
             pass
 
+    # ── Regime detection — pick strategy for today ────────────────────────
+    # Enrich candidates with rvol from picks so regime has real volume data.
+    rvol_lookup = {p["ticker"]: p.get("rvol", 0) for p in picks}
+    enriched_candidates = [
+        {**c, "rvol": rvol_lookup.get(c["ticker"], c.get("rvol", 0))}
+        for c in candidates
+    ]
+    strategy_name, regime_score = pick_strategy(mkt_ctx, enriched_candidates, params)
+    print(f"\n  Regime scores — {regime_score}")
+    print(f"  Strategy for today: {strategy_name}"
+          f"  (fallback window: {FALLBACK_WINDOW_NL.get(strategy_name, 'n/a')} NL)")
+    send_message(
+        f"📊 <b>Regime</b>: ORB {regime_score.orb}  IB {regime_score.ib}"
+        f"  VWAP {regime_score.vwap}\n"
+        f"  → <b>{strategy_name}</b> today"
+        + (f"  (fallback by {FALLBACK_WINDOW_NL[strategy_name]} NL)"
+           if strategy_name in FALLBACK_WINDOW_NL else "")
+    )
+
     # ── Sort by confidence, keep top MAX_CONCURRENT_POSITIONS ─────────────
     picks.sort(key=lambda x: x["confidence"], reverse=True)
     picks = picks[: config.MAX_CONCURRENT_POSITIONS]
 
     # ── Write watchlist + notify ───────────────────────────────────────────
-    _write_watchlist(picks, eurusd)
+    _write_watchlist(picks, eurusd, strategy=strategy_name)
     _tg_watchlist_summary(picks)
 
     print(f"\n  Done — {len(picks)} pick(s) in today's watchlist.")
