@@ -1,26 +1,42 @@
 """
-backtest.py — ORB strategy backtester.
+backtest.py — Multi-strategy backtester (ORB / IB / VWAP).
 
-Uses orb_core.simulate_session() — the identical logic as the live engine.
-Direction modes (no AI in any mode — avoids lookahead bias):
-  auto        -> true ORB: mark 5-min opening range, then watch 1-min bars;
-                 take whichever side (long or short) breaks out first + retests.
-                 This is the default and the correct ORB behaviour.
-  mechanical  -> pre-set direction from opening candle colour (green=long, red=short).
-  long/short  -> always that side (isolates one direction for analysis).
+Strategies
+──────────
+  orb   5-min Opening Range Breakout (default)
+  ib    60-min Initial Balance Breakout (no RVOL gate, fires after 10:30 ET)
+  vwap  VWAP Reversion — fade price when 1.5 %+ away from VWAP
 
-Usage:
-  # Fetch from IBKR + cache, then run (true ORB, auto direction):
-  python backtest.py --ticker NVDA --start 2025-01-01 --end 2025-06-01
+Direction modes (no AI — avoids lookahead bias):
+  auto        first breakout / first overextension wins  (default)
+  mechanical  pre-set from opening candle colour (green=long, red=short)
+  long/short  always that side
 
-  # Cache-only after first fetch:
-  python backtest.py --ticker NVDA --start 2025-01-01 --end 2025-06-01 --no-ibkr
+Usage — cached NVDA data (2026-06-05 → 2026-06-24)
+─────────────────────────────────────────────────────
+  # ORB (5-min range):
+  python backtest.py --ticker NVDA --start 2026-06-05 --end 2026-06-24 --no-ibkr
 
-  # Force long only, show per-bar trace:
-  python backtest.py --ticker NVDA --start 2025-01-01 --end 2025-06-01 --bias long --verbose
+  # IB (60-min Initial Balance):
+  python backtest.py --ticker NVDA --start 2026-06-05 --end 2026-06-24 --strategy ib --no-ibkr
 
-Walk-forward:
-  Run twice with non-overlapping date ranges; compare in-sample vs out-of-sample metrics.
+  # VWAP reversion:
+  python backtest.py --ticker NVDA --start 2026-06-05 --end 2026-06-24 --strategy vwap --no-ibkr
+
+  # Compare other cached tickers:
+  python backtest.py --ticker MU   --start 2026-06-09 --end 2026-06-24 --strategy ib   --no-ibkr
+  python backtest.py --ticker GLW  --start 2026-06-09 --end 2026-06-24 --strategy vwap --no-ibkr
+  python backtest.py --ticker AMAT --start 2026-06-09 --end 2026-06-24 --strategy ib   --no-ibkr
+
+  # Per-bar trace for one day:
+  python backtest.py --ticker NVDA --start 2026-06-10 --end 2026-06-10 --strategy vwap --no-ibkr --verbose
+
+Walk-forward (run twice with different date ranges):
+  python backtest.py --ticker NVDA --start 2026-06-05 --end 2026-06-12 --strategy ib --no-ibkr
+  python backtest.py --ticker NVDA --start 2026-06-15 --end 2026-06-24 --strategy ib --no-ibkr
+
+Regime scenario test (auto-picks strategy per day via RVOL + gap):
+  python test_scenario.py --ticker NVDA --start 2026-06-05 --end 2026-06-24
 """
 import argparse
 import csv
@@ -152,26 +168,77 @@ def _save_trades_csv(trades: list[dict], path: Path) -> None:
 
 # ── Main backtest loop ────────────────────────────────────────────────────────
 
+def _run_session(
+    strategy:    str,
+    bars:        list[Bar],
+    bias:        str,
+    capital_usd: float,
+    cfg:         ORBConfig,
+    verbose:     bool,
+):
+    """Route one session to the correct simulate function."""
+    if strategy == "ib":
+        from ib_strategy import simulate_ib_session
+        return simulate_ib_session(bars, capital_usd, config.INTRADAY_PARAMS,
+                                   bias=bias, verbose=verbose)
+    elif strategy == "vwap":
+        from vwap_strategy import simulate_vwap_session
+        return simulate_vwap_session(bars, capital_usd, config.INTRADAY_PARAMS,
+                                     bias=bias, verbose=verbose)
+    else:  # orb
+        if len(bars) < cfg.range_minutes + 1:
+            return None
+        opening = bars[:cfg.range_minutes]
+        post    = bars[cfg.range_minutes:]
+        return simulate_session(opening, post, capital_usd, cfg,
+                                bias=bias, verbose=verbose)
+
+
+def _result_to_dict(result, ticker: str, d: date, bias: str,
+                    strategy: str, equity_usd: float) -> dict:
+    """Normalise a TradeResult or VWAPTradeResult to a flat CSV-ready dict."""
+    return {
+        "date":              d.isoformat(),
+        "ticker":            ticker,
+        "strategy":          strategy,
+        "bias":              bias,
+        "direction":         result.direction,
+        "entry":             round(result.entry, 4),
+        "stop":              round(result.stop, 4),
+        "target":            round(result.target, 4),
+        "exit_price":        round(result.exit_price, 4),
+        "exit_reason":       result.exit_reason,
+        "qty":               result.qty,
+        "r_multiple":        round(result.r_multiple, 4),
+        "gross_pnl":         round(result.gross_pnl, 2),
+        "commission":        round(result.commission, 2),
+        "net_pnl":           round(result.net_pnl, 2),
+        "equity_usd":        round(equity_usd, 2),
+        "rvol_at_breakout":  round(getattr(result, "rvol_at_breakout", 0), 3),
+    }
+
+
 def run_backtest(
     ticker:    str,
     start:     date,
     end:       date,
-    bias_mode: str  = "mechanical",
+    strategy:  str  = "orb",
+    bias_mode: str  = "auto",
     ib              = None,
     verbose:   bool = False,
 ) -> dict:
-    """Run the ORB backtest and return metrics + trade list + equity curve.
+    """Run a backtest and return metrics + trade list + equity curve.
 
     Args:
         ticker:    Stock symbol (e.g. "NVDA").
         start/end: Date range inclusive.
-        bias_mode: "mechanical" | "long" | "short".
+        strategy:  "orb" | "ib" | "vwap"
+        bias_mode: "auto" | "mechanical" | "long" | "short"
         ib:        Connected ib_async IB instance, or None for cache-only.
-        verbose:   Print per-bar trace via orb_core.simulate_session.
+        verbose:   Print per-bar trace.
     """
     cfg = ORBConfig.from_params(config.INTRADAY_PARAMS)
 
-    # Fixed FX rate for reproducibility — avoids day-by-day rate noise in P&L
     try:
         import ibkr_connector
         eurusd = ibkr_connector.get_eurusd_rate()
@@ -190,54 +257,26 @@ def run_backtest(
 
     for d in days:
         bars = sessions.get(d, [])
-        if len(bars) < cfg.range_minutes + 1:
-            continue  # not enough bars — holiday or data gap
+        if not bars:
+            continue
 
-        opening_bars = bars[:cfg.range_minutes]
-        post_bars    = bars[cfg.range_minutes:]
-
-        # "auto"       → pass through to simulate_session; it takes the first breakout
-        # "mechanical" → pre-set from opening candle colour (green=long, red=short)
-        # "long"/"short" → always that direction (for isolating one side)
+        opening_bars_for_bias = bars[:cfg.range_minutes] if len(bars) >= cfg.range_minutes else bars
         bias = (
-            _mechanical_bias(opening_bars)
+            _mechanical_bias(opening_bars_for_bias)
             if bias_mode == "mechanical"
-            else bias_mode   # "auto", "long", or "short" passed straight through
+            else bias_mode
         )
 
         if verbose:
-            print(f"\n{'─'*52}\n{d}  bias={bias.upper()}  equity=${equity_usd:,.2f}")
+            print(f"\n{'─'*52}\n{d}  strategy={strategy.upper()}"
+                  f"  bias={bias.upper()}  equity=${equity_usd:,.2f}")
 
-        result = simulate_session(
-            opening_bars = opening_bars,
-            post_bars    = post_bars,
-            capital_usd  = _risk_usd(equity_usd),
-            cfg          = cfg,
-            bias         = bias,
-            verbose      = verbose,
-        )
+        result = _run_session(strategy, bars, bias, _risk_usd(equity_usd), cfg, verbose)
 
         if result is not None:
             equity_usd += result.net_pnl
             equity_curve.append(equity_usd)
-            trades.append({
-                "date":         d.isoformat(),
-                "ticker":       ticker,
-                "bias":         bias,
-                "direction":    result.direction,
-                "entry":        round(result.entry, 4),
-                "stop":         round(result.stop, 4),
-                "target":       round(result.target, 4),
-                "exit_price":   round(result.exit_price, 4),
-                "exit_reason":  result.exit_reason,
-                "qty":          result.qty,
-                "r_multiple":   round(result.r_multiple, 4),
-                "gross_pnl":    round(result.gross_pnl, 2),
-                "commission":   round(result.commission, 2),
-                "net_pnl":      round(result.net_pnl, 2),
-                "equity_usd":   round(equity_usd, 2),
-                "rvol_at_breakout": round(result.rvol_at_breakout, 3),
-            })
+            trades.append(_result_to_dict(result, ticker, d, bias, strategy, equity_usd))
 
     metrics = compute_metrics(trades, equity_curve, len(days))
     return {
@@ -245,17 +284,19 @@ def run_backtest(
         "trades":       trades,
         "equity_curve": equity_curve,
         "eurusd":       eurusd,
+        "strategy":     strategy,
     }
 
 
 # ── Print summary ─────────────────────────────────────────────────────────────
 
 def _print_summary(
-    ticker: str, start: date, end: date, bias_mode: str, result: dict
+    ticker: str, start: date, end: date, bias_mode: str, result: dict,
+    strategy: str = "orb",
 ) -> None:
     m = result["metrics"]
     print(f"\n{'='*56}")
-    print(f"  ORB Backtest — {ticker}  {start} → {end}  bias={bias_mode}")
+    print(f"  {strategy.upper()} Backtest — {ticker}  {start} → {end}  bias={bias_mode}")
     print(f"{'='*56}")
     if "error" in m:
         print(f"  ⚠️  {m['error']}")
@@ -293,9 +334,12 @@ def main() -> None:
     p.add_argument("--ticker",   required=True,              help="Stock symbol")
     p.add_argument("--start",    required=True,              help="Start date YYYY-MM-DD")
     p.add_argument("--end",      required=True,              help="End date YYYY-MM-DD")
+    p.add_argument("--strategy", default="orb",
+                   choices=["orb", "ib", "vwap"],
+                   help="orb=5-min ORB (default); ib=60-min Initial Balance; vwap=VWAP reversion")
     p.add_argument("--bias",     default="auto",
                    choices=["auto", "mechanical", "long", "short"],
-                   help="auto=first breakout wins (true ORB); mechanical=opening candle colour; long/short=force")
+                   help="auto=first breakout/overextension (default); mechanical=opening candle; long/short=force")
     p.add_argument("--no-ibkr",  action="store_true",        help="Cache-only (no IBKR connect)")
     p.add_argument("--out",      default="results",          help="Output dir for CSV")
     p.add_argument("--verbose",  action="store_true",        help="Per-bar trace")
@@ -314,11 +358,13 @@ def main() -> None:
         except Exception as e:
             print(f"⚠️  IBKR connection failed ({e}). Running in cache-only mode.")
 
-    print(f"\nRunning backtest: {args.ticker}  {start} → {end}  bias={args.bias}\n")
+    print(f"\nRunning backtest: {args.ticker}  {start} → {end}"
+          f"  strategy={args.strategy}  bias={args.bias}\n")
     result = run_backtest(
         ticker    = args.ticker,
         start     = start,
         end       = end,
+        strategy  = args.strategy,
         bias_mode = args.bias,
         ib        = ib,
         verbose   = args.verbose,
@@ -327,12 +373,12 @@ def main() -> None:
     if ib is not None:
         ib.disconnect()
 
-    _print_summary(args.ticker, start, end, args.bias, result)
+    _print_summary(args.ticker, start, end, args.bias, result, strategy=args.strategy)
 
     if result["trades"]:
         out_path = (
             Path(args.out)
-            / f"{args.ticker}_{args.start}_{args.end}_{args.bias}.csv"
+            / f"{args.ticker}_{args.start}_{args.end}_{args.strategy}_{args.bias}.csv"
         )
         _save_trades_csv(result["trades"], out_path)
 
