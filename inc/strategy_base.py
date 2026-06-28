@@ -6,7 +6,7 @@ Split of responsibilities:
   Strategy  → decides signal + levels (entry, stop, target)
   Engine    → owns sizing, bracket order, EOD flatten, IBKR plumbing
 
-Adding a new strategy = drop a new file + register it in orb_strategy.py's
+Adding a new strategy = drop a new file + register it in lib/orb_strategy.py's
 STRATEGY_REGISTRY. No engine rewrite needed.
 """
 from __future__ import annotations
@@ -50,7 +50,7 @@ class Strategy(Protocol):
         ...
 
 
-# Registry: strategy name → class.  orb_strategy.py registers "orb" on import.
+# Registry: strategy name → class.  lib/orb_strategy.py registers "orb" on import.
 STRATEGY_REGISTRY: dict[str, type] = {}
 
 

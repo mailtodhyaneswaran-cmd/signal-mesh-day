@@ -10,8 +10,8 @@ Signal → Direction mapping:
   SELL → short (downside breakout only)
   HOLD → skip
 
-Run via Task Scheduler at ~15:25 NL:
-  python orb_strategy.py
+Run via live_engine.py (recommended) or directly:
+  python lib/orb_strategy.py
 """
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 import json

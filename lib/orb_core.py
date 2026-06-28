@@ -1,7 +1,7 @@
 """
 orb_core.py — shared Opening Range Breakout primitives.
 
-Imported by both the live engine (orb_strategy.py) and the backtester
+Imported by both the live engine (lib/orb_strategy.py) and the backtester
 (backtest.py).  No IBKR, no Telegram, no wall clock — pure logic.
 
 Public API
@@ -151,7 +151,7 @@ def rvol(
     return all_bars[global_idx].volume / base if base > 0 else 1.0
 
 
-# ── Primitive API (used by live orb_strategy.py) ─────────────────────────────
+# ── Primitive API (used by live lib/orb_strategy.py) ─────────────────────────
 
 def capture_opening_range(bars: Sequence[Bar], cfg: ORBConfig, ticker: str = "") -> Optional[OpeningRange]:
     """Build OpeningRange from the first orb_range_minutes candles.

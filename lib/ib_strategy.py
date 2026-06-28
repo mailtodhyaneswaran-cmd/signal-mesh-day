@@ -18,7 +18,7 @@ Live engine timing (NL):
   17:30 NL = 10:30 ET  — IB range closes, start watching for breakout
   18:30 NL = 12:30 ET  — suggested cutoff (FALLBACK_WINDOW_NL["IB"] = 17:00 NL)
 
-Run via the unified launcher or orb_strategy.py with STRATEGY = "ib".
+Run via the unified launcher (live_engine.py).
 """
 from __future__ import annotations
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
