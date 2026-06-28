@@ -31,6 +31,17 @@ Usage
 
   # Include live SPY/VIX from yfinance in regime scoring (historical):
   python test_scenario.py --ticker NVDA --start 2026-06-05 --end 2026-06-24 --live-context
+
+  # Fetch missing RTH session data from IBKR (first-time setup for non-NVDA tickers):
+  python test_scenario.py --ticker MU --start 2026-06-09 --end 2026-06-24 --ibkr
+
+Note: NVDA already has RTH data from earlier backtest runs.
+      MU / GLW / AMAT / SNDK / TECH only have premarket (_pm.csv) cached so far.
+      Run with --ibkr once to fetch RTH data, then re-run without --ibkr.
+
+VWAP trades every day? No — VWAP requires price to deviate ≥1.5 % from VWAP.
+On flat/low-volatility days it never triggers. That is correct and expected.
+Adjust vwap_min_deviation in config.py to lower the threshold (e.g., 0.01 = 1%).
 """
 import argparse
 import sys
@@ -137,6 +148,7 @@ def run_scenario(
     end:     date,
     verbose: bool = False,
     live:    bool = False,
+    ib             = None,
 ) -> None:
     params = config.INTRADAY_PARAMS
     cfg    = ORBConfig.from_params(params)
@@ -156,10 +168,21 @@ def run_scenario(
 
     days = _trading_days(start, end)
 
-    # Load all RTH sessions up front (cache-only)
+    # Load all RTH sessions (ib connection fetches missing ones if provided)
     sessions: dict[date, list] = {}
     for d in days:
-        sessions[d] = data_loader.load_session(ticker, d)
+        sessions[d] = data_loader.load_session(ticker, d, ib)
+
+    available = sum(1 for bars in sessions.values() if bars)
+    if available == 0:
+        print(f"  ⚠️  No RTH session data found for {ticker} in this range.")
+        print(f"  RTH bars are separate from premarket (_pm.csv) data.")
+        print(f"  Fix: run with --ibkr to fetch from IBKR, or run first:")
+        print(f"    python backtest.py --ticker {ticker} --start {start} --end {end}")
+        print()
+        return
+    if available < len(days):
+        print(f"  ℹ  {available}/{len(days)} trading days have RTH data (rest are holidays/gaps)\n")
 
     # Equity trackers per strategy + regime-adaptive
     equity = {"orb": initial_usd, "ib": initial_usd, "vwap": initial_usd, "regime": initial_usd}
@@ -273,7 +296,19 @@ def main() -> None:
                    help="Per-bar trace for the regime-picked strategy each day")
     p.add_argument("--live-context",  action="store_true",
                    help="Fetch historical SPY/VIX from yfinance for richer regime scoring")
+    p.add_argument("--ibkr",          action="store_true",
+                   help="Connect IBKR to fetch missing RTH session bars (needed for non-NVDA tickers)")
     args = p.parse_args()
+
+    ib = None
+    if args.ibkr:
+        try:
+            import ibkr_connector
+            print("Connecting to IBKR to fetch missing RTH session data...")
+            ib = ibkr_connector.connect()
+            print("Connected.\n")
+        except Exception as e:
+            print(f"⚠️  IBKR connection failed: {e}\n")
 
     run_scenario(
         ticker  = args.ticker,
@@ -281,7 +316,11 @@ def main() -> None:
         end     = date.fromisoformat(args.end),
         verbose = args.verbose,
         live    = args.live_context,
+        ib      = ib,
     )
+
+    if ib is not None:
+        ib.disconnect()
 
 
 if __name__ == "__main__":
