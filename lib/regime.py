@@ -30,8 +30,8 @@ Scoring table (from todo_master.md):
   RVOL 1.5–3x             +1   +2    0
   RVOL < 1.5x              0    0   +2
 """
-import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 from __future__ import annotations
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
 from dataclasses import dataclass, field
 

@@ -10,6 +10,7 @@ Adding a new strategy = drop a new file + register it in orb_strategy.py's
 STRATEGY_REGISTRY. No engine rewrite needed.
 """
 from __future__ import annotations
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence, runtime_checkable

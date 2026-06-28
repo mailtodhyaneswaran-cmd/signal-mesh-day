@@ -20,8 +20,8 @@ Live engine timing (NL):
 
 Run via the unified launcher or orb_strategy.py with STRATEGY = "ib".
 """
-import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 from __future__ import annotations
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
 from orb_core import (
     ORBConfig, Bar, OpeningRange,

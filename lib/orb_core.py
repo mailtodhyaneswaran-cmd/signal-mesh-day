@@ -20,8 +20,8 @@ Shared helpers:
   position_size_usd(risk_usd, stop_distance) -> int
   rvol(global_idx, all_bars, opening_bars, cfg) -> float
 """
-import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 from __future__ import annotations
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
 import statistics
 from dataclasses import dataclass, field

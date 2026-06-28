@@ -28,8 +28,8 @@ Key differences from ORB/IB
 VWAP formula (typical/price weighting):
   VWAP = sum((H + L + C) / 3 × V) / sum(V)
 """
-import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 from __future__ import annotations
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
 import statistics
 from dataclasses import dataclass, field
