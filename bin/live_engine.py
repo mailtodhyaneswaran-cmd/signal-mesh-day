@@ -14,8 +14,6 @@ from orb_strategy.py.  Only the signal-detection phase differs.
 
 Run via Task Scheduler at ~15:25 NL:
   python bin/live_engine.py
-
-Update run_us.bat to call this file instead of orb_strategy.py.
 """
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
@@ -41,12 +39,15 @@ from orb_strategy import (
     _risk_usd, _today_at, _wait_until,
     _load_state, _save_state,
     _monitor_bracket, _eod_safety_flatten,
-    run_ticker as run_ticker_orb,
+    run_ticker_orb,
 )
 
 NL             = ZoneInfo("Europe/Amsterdam")
 US_OPEN        = "15:30"   # 09:30 ET
 US_SESSION_END = "22:00"   # 16:00 ET — hard EOD flatten
+
+# ORB timings
+US_ORB_WINDOW_END  = "19:00"  # 13:00 ET — stop looking for ORB breakout
 
 # IB timings
 US_IB_RANGE_END   = "16:30"  # 10:30 ET — 60-min IB range closes
@@ -392,21 +393,12 @@ def main() -> None:
 
     threads: list[threading.Thread] = []
     for pick in actionable[:config.MAX_CONCURRENT_POSITIONS]:
-        # ORB runner doesn't have state_lock in its old signature — wrap it
-        if runner is run_ticker_orb:
-            t = threading.Thread(
-                target=run_ticker_orb,
-                args=(pick, ib, state, state_lock),
-                name=f"{strategy}-{pick['ticker']}",
-                daemon=True,
-            )
-        else:
-            t = threading.Thread(
-                target=runner,
-                args=(pick, ib, state, state_lock),
-                name=f"{strategy}-{pick['ticker']}",
-                daemon=True,
-            )
+        t = threading.Thread(
+            target=runner,
+            args=(pick, ib, state, state_lock),
+            name=f"{strategy}-{pick['ticker']}",
+            daemon=True,
+        )
         t.start()
         threads.append(t)
         print(f"  [{pick['ticker']}] {strategy} thread started")

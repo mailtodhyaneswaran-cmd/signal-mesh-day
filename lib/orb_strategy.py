@@ -34,9 +34,10 @@ NL = ZoneInfo("Europe/Amsterdam")
 _SIGNAL_TO_DIRECTION = {"BUY": "long", "SELL": "short", "HOLD": "skip"}
 
 # US session window (NL / Amsterdam time)
-US_OPEN        = "15:30"
-US_OPEN_END    = "15:35"   # opening range closes at this time
-US_SESSION_END = "22:00"   # hard EOD flatten
+US_OPEN          = "15:30"
+US_OPEN_END      = "15:35"   # opening range closes at this time
+US_ORB_WINDOW_END = "19:00"  # 13:00 ET — stop looking for ORB setup
+US_SESSION_END   = "22:00"   # hard EOD flatten
 
 
 # ── Strategy Protocol implementation ─────────────────────────────────────────
@@ -161,7 +162,7 @@ def _save_state(state: dict) -> None:
 
 # ── Session runner (single ticker) ───────────────────────────────────────────
 
-def run_ticker(
+def run_ticker_orb(
     pick:       dict,
     ib,
     state:      dict,
@@ -174,6 +175,7 @@ def run_ticker(
     currency  = pick.get("currency", "USD")
     cfg       = ORBConfig.from_params(config.INTRADAY_PARAMS)
     session_end = _today_at(US_SESSION_END)
+    window_end  = _today_at(US_ORB_WINDOW_END)
 
     if direction == "skip":
         send_message(f"😴 {ticker} — HOLD signal, skipping ORB today.")
@@ -231,7 +233,7 @@ def run_ticker(
     direction_confirmed = None
     polls_per_sec       = config.INTRADAY_PARAMS.poll_interval_sec
 
-    while datetime.now(NL) < session_end:
+    while datetime.now(NL) < window_end:
         bar_raw = ibkr_connector.get_latest_closed_1min_bar(ib, contract)
         if bar_raw is None:
             time.sleep(polls_per_sec)
@@ -297,7 +299,7 @@ def run_ticker(
 
         time.sleep(polls_per_sec)
 
-    send_message(f"😴 {ticker} — no clean ORB setup today, window closed.")
+    send_message(f"😴 {ticker} ORB — no clean setup by {US_ORB_WINDOW_END} NL, standing aside.")
 
 
 def _monitor_bracket(ib, contract, trades, direction, bracket, orng,
@@ -372,67 +374,7 @@ def _eod_safety_flatten(ib, actionable: list) -> None:
         print(f"[EOD safety flatten] {e}")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    print(f"\n{'='*55}")
-    print(f"  Signal Mesh Day — ORB Engine")
-    print(f"  {datetime.now(NL).strftime('%Y-%m-%d %H:%M')} NL")
-    print(f"  LIVE_TRADING = {config.LIVE_TRADING}")
-    print(f"{'='*55}\n")
-
-    picks = _load_watchlist()
-    actionable = [p for p in picks if _SIGNAL_TO_DIRECTION.get(p.get("signal", "HOLD"), "skip") != "skip"]
-
-    if not actionable:
-        send_message("😴 No actionable picks in today's watchlist (all HOLD).")
-        return
-
-    send_message(
-        f"🚀 <b>ORB engine starting</b>  ·  {len(actionable)} pick(s) to watch\n"
-        + "\n".join(
-            f"  {'📈' if p.get('signal') == 'BUY' else '📉'} {p['ticker']}  "
-            f"{_SIGNAL_TO_DIRECTION.get(p.get('signal','HOLD'),'skip').upper()}  "
-            f"RVOL {p.get('rvol', '?')}x  ·  {p.get('catalyst', '')}"
-            for p in actionable
-        )
-    )
-
-    try:
-        ib = ibkr_connector.connect()
-    except Exception as e:
-        msg = f"🔴 IBKR connection failed: {e}\nIs TWS/Gateway running?"
-        print(msg); send_message(msg)
-        return
-
-    state      = _load_state()
-    state_lock = threading.Lock()
-
-    # Spawn one thread per pick — all tickers monitored concurrently
-    threads: list[threading.Thread] = []
-    for pick in actionable[:config.MAX_CONCURRENT_POSITIONS]:
-        t = threading.Thread(
-            target = run_ticker,
-            args   = (pick, ib, state, state_lock),
-            name   = f"orb-{pick['ticker']}",
-            daemon = True,
-        )
-        t.start()
-        threads.append(t)
-        print(f"  [{pick['ticker']}] thread started")
-
-    # Wait for every ticker thread to finish
-    for t in threads:
-        t.join()
-
-    # Hard EOD safety net — close anything still open (unhandled thread crash)
-    print("\n  Running EOD safety flatten check...")
-    _eod_safety_flatten(ib, actionable)
-
-    ib.disconnect()
-    send_message("✅ ORB session complete — all positions flat.")
-    print("\nDisconnected cleanly.")
-
-
 if __name__ == "__main__":
-    main()
+    # Delegate to the unified dispatcher — avoids duplicating orchestration logic.
+    import live_engine
+    live_engine.main()
