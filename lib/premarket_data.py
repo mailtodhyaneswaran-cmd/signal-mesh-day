@@ -8,7 +8,7 @@ Public API
 ──────────
   fetch_market_context()                              -> dict
   batch_gap_scan(tickers, params)                     -> list[dict]
-  enrich_ticker(ticker, mkt_ctx, candidates, eurusd, params) -> dict
+  enrich_ticker(ticker, mkt_ctx, candidates, eurusd, params, ib=None) -> dict
 """
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 import json
@@ -422,30 +422,65 @@ def enrich_ticker(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _fetch_news(ticker: str) -> tuple[list[dict], str]:
+def _fetch_news(ticker: str, max_age_hours: int = 24) -> tuple[list[dict], str]:
     """
-    Fetch news headlines from yfinance. Handles both old and new SDK formats.
-    Returns (headlines_list, catalyst_summary).
+    Fetch news headlines from yfinance, sorted newest-first, filtered to last
+    max_age_hours.  Returns (headlines_list, catalyst_summary).
+
+    The catalyst is the most recent headline within the window — not whatever
+    Yahoo happens to rank first — so it reflects the actual reason for the gap
+    rather than a loosely related older story.
     """
+    import time as _time
+
     try:
-        items     = yf.Ticker(ticker).news or []
-        headlines = []
-        for item in items[:8]:
-            try:
-                # New yfinance format (≥0.2): item["content"]["title"]
-                content = item.get("content", {})
-                title   = content.get("title") or item.get("title", "")
-                pub     = (content.get("provider", {}).get("displayName")
-                           or item.get("publisher", ""))
-                dt      = content.get("pubDate") or str(item.get("providerPublishTime", ""))
-                if title:
-                    headlines.append({"title": title, "publisher": pub, "date": dt})
-            except Exception:
-                pass
-        catalyst = headlines[0]["title"] if headlines else "No significant premarket news found"
-        return headlines, catalyst
+        items = yf.Ticker(ticker).news or []
     except Exception:
         return [], "No news data available"
+
+    now_ts   = _time.time()
+    cutoff   = now_ts - max_age_hours * 3600
+    parsed   = []
+
+    for item in items:
+        try:
+            content = item.get("content", {})
+            title   = content.get("title") or item.get("title", "")
+            if not title:
+                continue
+            pub = (content.get("provider", {}).get("displayName")
+                   or item.get("publisher", ""))
+            # Resolve timestamp: ISO string (new SDK) or Unix int (old SDK)
+            raw_ts = content.get("pubDate") or item.get("providerPublishTime")
+            ts: float = 0.0
+            if isinstance(raw_ts, (int, float)):
+                ts = float(raw_ts)
+            elif isinstance(raw_ts, str) and raw_ts:
+                try:
+                    from datetime import datetime as _datetime
+                    ts = _datetime.fromisoformat(
+                        raw_ts.replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    ts = 0.0
+            parsed.append({"title": title, "publisher": pub, "ts": ts,
+                           "date": raw_ts or ""})
+        except Exception:
+            continue
+
+    # Sort newest-first, then filter to window
+    parsed.sort(key=lambda x: x["ts"], reverse=True)
+    recent = [h for h in parsed if h["ts"] == 0.0 or h["ts"] >= cutoff]
+
+    # Fall back to all headlines if the time filter kills everything
+    headlines = recent[:8] if recent else parsed[:8]
+
+    # Strip internal ts field before returning
+    out = [{"title": h["title"], "publisher": h["publisher"], "date": h["date"]}
+           for h in headlines]
+
+    catalyst = out[0]["title"] if out else "No significant premarket news found"
+    return out, catalyst
 
 
 def _round_levels(price: float) -> str:
