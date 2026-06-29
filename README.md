@@ -80,7 +80,8 @@ signal-mesh-day/
 
 15:30 NL — Live Engine (live_engine.py)
 ─────────────────────────────────────────────────────
-  Reads watchlist → strategy field → dispatches:
+  Reads watchlist (waits up to 10 min if screener still running)
+  → strategy field → dispatches:
 
   ORB  (gap + RVOL days)     wait 15:35, 5-min range, breakout+retest
   IB   (moderate-gap days)   wait 16:30, 60-min range, breakout+retest

@@ -130,15 +130,26 @@ def _wait_until(target: datetime) -> None:
         time.sleep(min(remaining, 30))
 
 
-def _load_watchlist() -> list[dict]:
-    """Load today's watchlist_YYYYMMDD.json from WATCHLIST_DIR."""
+def _load_watchlist(wait_minutes: int = 10) -> list[dict]:
+    """Load today's watchlist_YYYYMMDD.json from WATCHLIST_DIR.
+
+    If the file doesn't exist yet (screener still running), waits up to
+    wait_minutes before raising FileNotFoundError.
+    """
     today = datetime.now(NL).strftime("%Y%m%d")
     path  = Path(config.WATCHLIST_DIR) / f"watchlist_{today}.json"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Watchlist not found: {path}\n"
-            f"Run the Phase 1 screener first."
-        )
+    deadline = time.time() + wait_minutes * 60
+    while not path.exists():
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise FileNotFoundError(
+                f"Watchlist not found after waiting {wait_minutes}m: {path}\n"
+                f"Run the Phase 1 screener first."
+            )
+        wait = min(30, remaining)
+        print(f"  [watchlist] File not ready yet — retrying in {wait:.0f}s "
+              f"({remaining/60:.1f}m left)...")
+        time.sleep(wait)
     with open(path) as f:
         data = json.load(f)
     return data.get("picks", [])
