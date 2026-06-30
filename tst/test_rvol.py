@@ -2,10 +2,13 @@
 test_rvol.py — Test real premarket RVOL + optional AI analysis for one ticker.
 
 Reuses:
-  ibkr_connector  — connect, get_premarket_volume_ibkr, get_avg_premarket_volume_ibkr
-  data_loader     — load_premarket_session (cached _pm.csv files)
-  premarket_data  — fetch_market_context, enrich_ticker (with ib connection)
+  ibkr_connector   — connect, get_premarket_volume_ibkr, get_avg_premarket_volume_ibkr
+  data_loader      — load_premarket_session (cached _pm.csv files)
+  premarket_data   — fetch_market_context, enrich_ticker (with ib connection)
   day_orchestrator — _build_agents, _run_round1, _run_cross_pollination, _aggregate
+
+RVOL thresholds (rvol_hard_floor, rvol_full_conviction) are read from
+dat/config.py → INTRADAY_PARAMS — change them there, not here.
 
 Steps
 ─────
@@ -14,7 +17,8 @@ Steps
   3  20-day avg premarket vol  (cached _pm.csv files; fetches from IBKR if missing)
   4  RVOL = today / avg20d
   5  Full enrich_ticker() — gap, ATR, news, EUR/USD, all prompt fields
-  6  AI analysis (--ai flag) — 5 bulk calls × Claude + Mistral → LONG/SHORT/NOTHING
+  6  AI analysis (--ai flag) — 5 bulk calls × N agents → LONG/SHORT/NOTHING
+       Applies tiered RVOL gate from config.py before running AI prompts.
 
 Usage
 ─────

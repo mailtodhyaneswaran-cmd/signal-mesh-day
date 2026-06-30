@@ -1,14 +1,21 @@
 """
 day_orchestrator.py — Signal Mesh Day — Phase 1 AI screener.
 
-Runs premarket (~15:00 NL / ~09:00 ET):
+Runs premarket (~14:55 NL / ~09:00 ET):
   1. Scan S&P 500 → shortlist 5 candidates by gap + volume score
-  2. Enrich each with full premarket data (yfinance)
-  3. Run 25 prompts × 2 agents (Claude + Mistral) per ticker
-  4. Cross-pollination round (each agent reviews the other's conclusions)
-  5. Aggregate votes → top 3 directional picks
-  6. Write watchlist_YYYYMMDD.json (read by the ORB engine)
-  7. Telegram notifications at each stage
+  2. Preflight smoke-test each agent; abort loudly if all fail
+  3. Enrich each candidate with full premarket data (IBKR RVOL + yfinance)
+  4. Hard RVOL veto — skip ticker if below rvol_hard_floor (config.py)
+  5. Run 5 bulk category calls × N agents (25 analyses total) per ticker
+  6. Mesh health check — if ≥40% analyses errored, skip ticker with Telegram alert
+  7. Cross-pollination round (each agent sees the other's conclusions and may revise)
+  8. Aggregate per-agent nets → directional bias (LONG / SHORT / NOTHING)
+  9. Regime scoring → pick today's strategy (ORB / IB / VWAP / SIT_OUT)
+  10. Write watchlist_YYYYMMDD.json + mesh_health_YYYYMMDD.jsonl
+  11. Telegram notifications throughout
+
+All tunable thresholds (RVOL floors, direction_threshold, category_weights) are set
+in dat/config.py → INTRADAY_PARAMS — the single source of truth.
 
 Usage
 ─────
@@ -20,6 +27,9 @@ Usage
 
   # Show full prompt + response (debug):
   python day_orchestrator.py --tickers NVDA --verbose
+
+  # Fast logic test — no API calls:
+  python day_orchestrator.py --tickers NVDA MU --mock
 """
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 import argparse

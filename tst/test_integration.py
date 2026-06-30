@@ -7,7 +7,9 @@ Tests the complete pipeline for a specific historical date using real IBKR data:
   Step 2  Load 1-min session bars from IBKR (cached or fetched)
   Step 3  Compute opening range + RVOL from historical bars
   Step 4  Fetch premarket context via yfinance (prior close, ATR, news)
-  Step 5  Run AI mesh (25 prompts × Claude + Mistral) → directional bias
+  Step 5  Run AI mesh (5 bulk calls × N agents, 25 analyses) → directional bias
+            Note: premarket RVOL is unavailable for historical dates → Step 5 skips
+            unless --skip-rvol is passed to bypass the RVOL gate.
   Step 6  Run ORB simulation on historical bars → entry / stop / target
   Step 7  Place bracket order on IBKR paper account
   Step 8  Verify all order legs appear in IBKR open orders  ← PASS condition
@@ -16,16 +18,22 @@ Tests the complete pipeline for a specific historical date using real IBKR data:
 PASS condition: all 3 bracket legs (entry limit + stop loss + take profit) visible
 in IBKR open orders after placement.
 
+All thresholds (RVOL floor, direction_threshold) are read from dat/config.py —
+no values are hardcoded in this test.
+
 Usage
 ─────
   # Default: NVDA on 2026-06-24
   python test_integration.py
 
   # Different ticker / date:
-  python test_integration.py --ticker TSLA --date 2026-06-23
+  python test_integration.py --ticker TSLA --date 2026-06-29
 
-  # Skip AI prompts (much faster — tests data + ORB + order placement only):
+  # Skip AI prompts (faster — tests data + ORB + order placement only):
   python test_integration.py --skip-ai
+
+  # Bypass RVOL gate (historical dates have no premarket volume data):
+  python test_integration.py --ticker TSLA --date 2026-06-29 --skip-rvol
 
   # Leave orders open after test (inspect in TWS):
   python test_integration.py --no-cancel

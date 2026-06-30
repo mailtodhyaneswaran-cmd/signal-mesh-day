@@ -4,40 +4,51 @@ Signal Mesh — DAY-TRADING prompt set (premarket bias generator)
 
 Purpose
 -------
-This is the intraday counterpart to `analysis_prompts.py` (which is swing-only).
-The day-trading orchestrator runs ~09:00 ET (≈15:00 NL), i.e. BEFORE the 09:30 ET
-US open. At that moment there is NO opening range, NO realized VWAP, and NO live
-TICK yet — only PREMARKET evidence. So every prompt here produces a PREMARKET
-DIRECTIONAL BIAS plus the levels to watch. The ORB engine (`orb_core`) then
-CONFIRMS that bias live at the open. Two independent confirmations:
+Defines the 25 AI prompts (5 categories x 5 prompts) used by day_orchestrator.py
+to generate a premarket directional bias for each shortlisted ticker. The orchestrator
+runs ~14:55 NL (09:00 ET), BEFORE the 09:30 ET US open. At that moment there is NO
+opening range, NO realized VWAP, and NO live TICK yet — only PREMARKET evidence.
+Each prompt returns a bias (LONG / SHORT / NOTHING); the live engine then CONFIRMS
+that bias at the open via ORB / IB / VWAP mechanics:
 
-    Signal Mesh Day (premarket bias)  ──►  ORB breakout in that direction  ──►  trade
+    Premarket mesh bias  ──►  regime strategy confirms at open  ──►  bracket order
+
+Calling pattern
+---------------
+The orchestrator sends ONE bulk API call per category per agent (5 calls × N agents),
+each returning a JSON array of 5 results. This is more reliable and faster than 25
+individual calls.
 
 Output vocabulary
 -----------------
 Every prompt returns one of:  "LONG" | "SHORT" | "NOTHING"
-  LONG    -> bias to buy; ORB will only act on an UPSIDE breakout
-  SHORT   -> bias to sell short; ORB will only act on a DOWNSIDE breakout
+  LONG    -> bias to buy; strategy engine only acts on an UPSIDE confirmation
+  SHORT   -> bias to sell short; strategy engine only acts on a DOWNSIDE confirmation
   NOTHING -> stand aside (the correct default; day trading rewards selectivity)
 
-Every prompt ALSO returns a risk read:
+Every prompt ALSO returns:
   conviction  : 0-100   (how strongly the bias is held)
   risk_level  : "low" | "medium" | "high"
-and the level-bearing prompts return suggested_entry_zone / invalidation / target
-so the orchestrator can pre-stage the ORB bracket.
 
-5 categories x 5 prompts = 25 (parity with the swing mesh), remapped for intraday:
-  PRICE_ACTION   (was Technical)   -> premarket structure, gap, key levels
-  CATALYST       (was Fundamental) -> the fresh event driving today's move
-  SENTIMENT_FLOW (was Sentiment)   -> news tone, social velocity, positioning
-  MARKET_REGIME  (was Macro)       -> futures / SPY / VIX / sector / macro calendar
-  QUANT_EDGE     (was Quant)       -> RVOL gate, gap stats, ATR, float, risk sizing
+5 categories x 5 prompts = 25 analyses per ticker:
+  PRICE_ACTION   -> premarket structure, gap type, key levels
+  CATALYST       -> the fresh event driving today's move
+  SENTIMENT_FLOW -> news tone, social velocity, positioning
+  MARKET_REGIME  -> futures / SPY / VIX / sector / macro calendar
+  QUANT_EDGE     -> RVOL gate, gap stats, ATR, float, risk sizing
 
-DATA CONTRACT — premarket variables the orchestrator must supply (all available
-pre-open from yfinance / IBKR):
+Parameters
+----------
+All tunable thresholds (rvol_hard_floor, direction_threshold, category_weights, etc.)
+live exclusively in dat/config.py → INTRADAY_PARAMS (SimpleNamespace). Do not
+hardcode values here. rvol_conviction_cap() and aggregate_ticker() default to
+config.INTRADAY_PARAMS when called without an explicit params argument.
+
+DATA CONTRACT — premarket variables supplied by enrich_ticker() (premarket_data.py):
   {ticker} {prior_close} {prior_high} {prior_low}
   {premarket_price} {premarket_high} {premarket_low} {premarket_gap_pct}
   {premarket_volume} {avg_premarket_volume_30d} {rvol_premarket}
+  {rvol_hard_floor} {rvol_full_conviction}
   {avg_daily_volume} {atr14} {atr_pct} {float_shares} {short_pct_float}
   {round_levels} {news_headlines} {social_metrics} {options_premarket}
   {catalyst_summary} {next_earnings_date}
