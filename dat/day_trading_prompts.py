@@ -109,6 +109,13 @@ INTRADAY_PARAMS = {
 }
 
 
+def _get(params, key):
+    """Read a value from params whether it is a dict or a SimpleNamespace."""
+    if isinstance(params, dict):
+        return params[key]
+    return getattr(params, key)
+
+
 def rvol_conviction_cap(rvol, params=INTRADAY_PARAMS):
     """Tiered RVOL gate, enforced DETERMINISTICALLY by the orchestrator on the
     numeric rvol — do not rely on the LLM to self-veto. Returns the max conviction
@@ -117,11 +124,13 @@ def rvol_conviction_cap(rvol, params=INTRADAY_PARAMS):
         rvol < hard_floor          -> 0    (hard NOTHING)
         hard_floor <= rvol < full  -> mid_cap
         rvol >= full               -> 100  (no cap)
+
+    params may be a dict (backtest) or SimpleNamespace (config.INTRADAY_PARAMS).
     """
-    if rvol < params["rvol_hard_floor"]:
+    if rvol < _get(params, "rvol_hard_floor"):
         return 0
-    if rvol < params["rvol_full_conviction"]:
-        return params["rvol_midtier_cap"]
+    if rvol < _get(params, "rvol_full_conviction"):
+        return _get(params, "rvol_midtier_cap")
     return 100
 
 
@@ -832,19 +841,22 @@ AGENT_SPECIALISATIONS = {
 # Reference implementation (orchestrator imports this; backtest passes a tuned params):
 def aggregate_ticker(prompt_results, rvol, params=INTRADAY_PARAMS):
     """Collapse all prompt votes for one ticker into a final bias. `prompt_results`
-    is an iterable of dicts with keys: signal, conviction, category."""
+    is an iterable of dicts with keys: signal, conviction, category.
+
+    params may be a dict (backtest) or SimpleNamespace (config.INTRADAY_PARAMS).
+    """
     cap = rvol_conviction_cap(rvol, params)
     if cap == 0:
         return {"direction": "NOTHING", "net": 0.0, "rvol_veto": True}
 
     vote_map = {"LONG": 1, "SHORT": -1, "NOTHING": 0}
-    weights = params["category_weights"]
+    weights = _get(params, "category_weights")
     net = 0.0
     for r in prompt_results:
         conv = min(r.get("conviction", 0), cap) / 100.0
         net += vote_map.get(r.get("signal", "NOTHING"), 0) * conv * weights.get(r.get("category"), 0)
 
-    thr = params["direction_threshold"]
+    thr = _get(params, "direction_threshold")
     direction = "LONG" if net >= thr else "SHORT" if net <= -thr else "NOTHING"
     return {"direction": direction, "net": round(net, 4), "rvol_veto": False}
 

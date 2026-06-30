@@ -40,20 +40,11 @@ import ibkr_connector
 from telegram_notify import send_message
 from day_trading_prompts import (
     ALL_INTRADAY_PROMPTS,
-    INTRADAY_PARAMS as _DTP_PARAMS_BASE,
     CROSS_POLLINATION_PROMPT,
     aggregate_ticker,
     rvol_conviction_cap,
     build_bulk_category_prompt,
 )
-
-# Merge config.INTRADAY_PARAMS on top of the day_trading_prompts defaults so that
-# changing config.py actually affects the screener veto and aggregation thresholds.
-# _DTP_PARAMS keys that also exist in config.INTRADAY_PARAMS are overridden.
-_DTP_PARAMS = {
-    **_DTP_PARAMS_BASE,
-    **{k: v for k, v in vars(config.INTRADAY_PARAMS).items() if k in _DTP_PARAMS_BASE},
-}
 from sp500_universe import get_sp500_tickers
 from premarket_data import fetch_market_context, batch_gap_scan, enrich_ticker
 from regime import pick_strategy, FALLBACK_WINDOW_NL
@@ -286,7 +277,7 @@ def _aggregate(round1: dict[str, list[dict]], rvol: float) -> dict:
     """
     agent_nets = []
     for results in round1.values():
-        agg = aggregate_ticker(results, rvol, _DTP_PARAMS)
+        agg = aggregate_ticker(results, rvol, config.INTRADAY_PARAMS)
         if not agg.get("rvol_veto"):
             agent_nets.append(agg["net"])
 
@@ -294,7 +285,7 @@ def _aggregate(round1: dict[str, list[dict]], rvol: float) -> dict:
         return {"direction": "NOTHING", "net": 0.0, "rvol_veto": True}
 
     avg_net   = round(sum(agent_nets) / len(agent_nets), 4)
-    thr       = _DTP_PARAMS["direction_threshold"]
+    thr       = config.INTRADAY_PARAMS.direction_threshold
     direction = "LONG" if avg_net >= thr else "SHORT" if avg_net <= -thr else "NOTHING"
     return {"direction": direction, "net": avg_net, "rvol_veto": False}
 
@@ -467,9 +458,9 @@ def run(
         rvol = float(data.get("rvol_premarket", 0))
 
         # Hard RVOL veto before running expensive prompts
-        cap = rvol_conviction_cap(rvol, _DTP_PARAMS)
+        cap = rvol_conviction_cap(rvol, config.INTRADAY_PARAMS)
         if cap == 0:
-            floor = _DTP_PARAMS["rvol_hard_floor"]
+            floor = config.INTRADAY_PARAMS.rvol_hard_floor
             print(f"  ⛔ RVOL {rvol:.1f}x < {floor}x — veto, skipping")
             send_message(f"⛔ <b>{ticker}</b>: RVOL {rvol:.1f}x below floor {floor}x — skipped")
             continue
@@ -541,7 +532,7 @@ def run(
             net       = 0.0
 
         # Conviction: 0% at threshold, 100% at 2× threshold and above
-        thr        = _DTP_PARAMS["direction_threshold"]
+        thr        = config.INTRADAY_PARAMS.direction_threshold
         conviction = min(max(abs(net) - thr, 0) / thr, 1.0) if thr > 0 else 0.0
 
         print(f"  → {direction}  net={net:+.4f}  conviction={conviction:.0%}")
