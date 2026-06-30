@@ -200,6 +200,7 @@ def _run_round1(prompt_data: dict, agents: dict) -> dict[str, list[dict]]:
             # One API call per category
             bulk_prompt = build_bulk_category_prompt(category, filled)
             raw         = agent.fetch_data(bulk_prompt)
+            print(f"    [{agent_name}|{category}] {json.dumps(raw, separators=(',', ':'))}")
             # Parse the JSON array of 5 back into individual result dicts
             parsed = _parse_bulk_response(raw, category, list(prompts.keys()))
             for r in parsed:
