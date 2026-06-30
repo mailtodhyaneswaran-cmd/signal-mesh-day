@@ -40,12 +40,20 @@ import ibkr_connector
 from telegram_notify import send_message
 from day_trading_prompts import (
     ALL_INTRADAY_PROMPTS,
-    INTRADAY_PARAMS as _DTP_PARAMS,
+    INTRADAY_PARAMS as _DTP_PARAMS_BASE,
     CROSS_POLLINATION_PROMPT,
     aggregate_ticker,
     rvol_conviction_cap,
     build_bulk_category_prompt,
 )
+
+# Merge config.INTRADAY_PARAMS on top of the day_trading_prompts defaults so that
+# changing config.py actually affects the screener veto and aggregation thresholds.
+# _DTP_PARAMS keys that also exist in config.INTRADAY_PARAMS are overridden.
+_DTP_PARAMS = {
+    **_DTP_PARAMS_BASE,
+    **{k: v for k, v in vars(config.INTRADAY_PARAMS).items() if k in _DTP_PARAMS_BASE},
+}
 from sp500_universe import get_sp500_tickers
 from premarket_data import fetch_market_context, batch_gap_scan, enrich_ticker
 from regime import pick_strategy, FALLBACK_WINDOW_NL
@@ -461,8 +469,9 @@ def run(
         # Hard RVOL veto before running expensive prompts
         cap = rvol_conviction_cap(rvol, _DTP_PARAMS)
         if cap == 0:
-            print(f"  ⛔ RVOL {rvol:.1f}x < {params.rvol_hard_floor}x — veto, skipping")
-            send_message(f"⛔ <b>{ticker}</b>: RVOL {rvol:.1f}x below floor — skipped")
+            floor = _DTP_PARAMS["rvol_hard_floor"]
+            print(f"  ⛔ RVOL {rvol:.1f}x < {floor}x — veto, skipping")
+            send_message(f"⛔ <b>{ticker}</b>: RVOL {rvol:.1f}x below floor {floor}x — skipped")
             continue
 
         print(f"  RVOL {rvol:.1f}x (cap={cap})  "
