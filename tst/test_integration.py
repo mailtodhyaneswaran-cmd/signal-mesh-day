@@ -115,6 +115,7 @@ def run_test(
     ticker:    str,
     test_date: date,
     skip_ai:   bool = False,
+    skip_rvol: bool = False,
     no_cancel: bool = False,
     verbose:   bool = False,
 ) -> bool:
@@ -252,11 +253,13 @@ def run_test(
             pm_rvol = float(prompt_data.get("rvol_premarket", 0))
             cap     = rvol_conviction_cap(pm_rvol, _DTP_PARAMS)
 
-            if cap == 0:
+            if cap == 0 and not skip_rvol:
                 print(f"  Premarket RVOL {pm_rvol:.1f}x < floor {_DTP_PARAMS['rvol_hard_floor']}x"
                       f" — RVOL veto  →  defaulting to LONG for order test")
                 results["5_ai_mesh"] = f"{_SKIP} (RVOL veto)"
             else:
+                if skip_rvol and cap == 0:
+                    print(f"  RVOL {pm_rvol:.1f}x would veto — bypassed via --skip-rvol")
                 print(f"  Agents: {list(agents.keys())}  |  RVOL cap: {cap}")
                 print(f"  Running 25 prompts × {len(agents)} agent(s)...")
                 round1 = _run_round1(prompt_data, agents)
@@ -464,16 +467,18 @@ def main() -> None:
     p.add_argument("--ticker",    default="NVDA",       help="Ticker to test")
     p.add_argument("--date",      default="2026-06-24", help="YYYY-MM-DD (historical session)")
     p.add_argument("--skip-ai",   action="store_true",  help="Skip AI prompts (faster)")
+    p.add_argument("--skip-rvol", action="store_true",  help="Bypass RVOL gate in AI mesh step (useful for historical dates where premarket data is gone)")
     p.add_argument("--no-cancel", action="store_true",  help="Leave orders open after test")
     p.add_argument("--verbose",   action="store_true",  help="Print AI prompt/response")
     args = p.parse_args()
 
     ok = run_test(
-        ticker    = args.ticker,
-        test_date = date.fromisoformat(args.date),
-        skip_ai   = args.skip_ai,
-        no_cancel = args.no_cancel,
-        verbose   = args.verbose,
+        ticker     = args.ticker,
+        test_date  = date.fromisoformat(args.date),
+        skip_ai    = args.skip_ai,
+        skip_rvol  = args.skip_rvol,
+        no_cancel  = args.no_cancel,
+        verbose    = args.verbose,
     )
     sys.exit(0 if ok else 1)
 
