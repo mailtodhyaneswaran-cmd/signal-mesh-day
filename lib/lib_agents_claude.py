@@ -67,8 +67,14 @@ class ClaudeAgent(BaseAgent):
                 print(f"{'─' * 60}\n")
 
             if not output:
-                err = result.stderr.strip()
-                return {"error": err or "empty response", "signal": "HOLD", "factor_score": 50}
+                err_detail = (result.stderr or "").strip()[:200]
+                return {
+                    "error":          err_detail or "empty response",
+                    "error_kind":     "empty",
+                    "returncode":     result.returncode,
+                    "stderr_snippet": err_detail,
+                    "signal": "HOLD", "factor_score": 50,
+                }
 
             try:
                 return json.loads(output)
@@ -98,10 +104,17 @@ class ClaudeAgent(BaseAgent):
                 except json.JSONDecodeError:
                     pass
 
-            return {"error": "unparseable response", "raw": output[:300], "signal": "HOLD", "factor_score": 50}
+            return {
+                "error":          "unparseable response",
+                "error_kind":     "unparseable",
+                "returncode":     result.returncode,
+                "stderr_snippet": (result.stderr or "").strip()[:200],
+                "raw":            output[:300],
+                "signal": "HOLD", "factor_score": 50,
+            }
 
         except subprocess.TimeoutExpired:
-            return {"error": "claude CLI timed out", "signal": "HOLD", "factor_score": 50}
+            return {"error": "claude CLI timed out", "error_kind": "timeout", "signal": "HOLD", "factor_score": 50}
         except FileNotFoundError:
             print("[ERROR] `claude` CLI not found. Install Claude Code and ensure it is on your PATH.")
             sys.exit(1)

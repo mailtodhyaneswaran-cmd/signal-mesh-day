@@ -326,8 +326,8 @@ def enrich_ticker(
             rvol_premarket = round(pm_volume / avg_pm_vol_estimate, 2)
             print(f"  [{ticker}] Estimated RVOL {rvol_premarket}x (yfinance / ×0.05 fallback)")
         else:
-            rvol_premarket = float(getattr(params, "rvol_hard_floor", 1.5))
-            print(f"  [{ticker}] Premarket volume unavailable — RVOL floor {rvol_premarket}x")
+            rvol_premarket = 0.0   # no real data → force hard veto downstream
+            print(f"  [{ticker}] Premarket volume unavailable — RVOL 0.0x (hard veto)")
 
     # ── Ticker info: float, sector, earnings ─────────────────────────────
     float_shares = short_pct = 0.0

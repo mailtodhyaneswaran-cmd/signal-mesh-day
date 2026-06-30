@@ -192,6 +192,21 @@ def run_ticker_orb(
         send_message(f"😴 {ticker} — HOLD signal, skipping ORB today.")
         return
 
+    # ── Conviction-modulated live RVOL gate (paper experiment) ───────────
+    p = config.INTRADAY_PARAMS
+    if getattr(p, "conviction_rvol_gate_enabled", False):
+        conv  = float(pick.get("confidence", 0.0))
+        base  = getattr(p, "conviction_rvol_base",  p.orb_rvol_gate)
+        span  = getattr(p, "conviction_rvol_span",  0.5)
+        floor = getattr(p, "conviction_rvol_floor", 1.0)
+        cap   = getattr(p, "conviction_rvol_cap",   2.5)
+        adj   = (0.5 - conv) * span   # high conviction loosens, low tightens
+        cfg.rvol_min = max(floor, min(base + adj, cap))
+        send_message(
+            f"Rvol gate {ticker}: {cfg.rvol_min:.2f}x "
+            f"(conviction {conv:.0%}, base {base})"
+        )
+
     # Thread-safe MAX_TRADES_PER_SYMBOL_PER_DAY gate
     with state_lock:
         if state["trades"].get(ticker):

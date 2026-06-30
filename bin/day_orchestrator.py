@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+_VALID_SIGNALS = {"LONG", "SHORT", "NOTHING"}
+
 import config
 
 # Set Mistral API key from config before importing the agent
@@ -89,6 +91,22 @@ def _build_agents(verbose: bool, mock: bool = False) -> dict:
     if not agents:
         raise RuntimeError("No AI agents available — install/configure at least one.")
     return agents
+
+
+# ── Preflight agent health check ─────────────────────────────────────────────
+
+_SMOKE_PROMPT = 'Reply with ONLY this JSON, nothing else: {"signal":"NOTHING","conviction":0}'
+
+
+def _agent_healthy(agent) -> bool:
+    try:
+        r = agent.fetch_data(_SMOKE_PROMPT, timeout=30)
+        return (
+            "error" not in r
+            and str(r.get("signal", "")).upper() in _VALID_SIGNALS
+        )
+    except Exception:
+        return False
 
 
 # ── Round-1: 5 bulk prompts per agent (one per category) ─────────────────────
@@ -153,6 +171,12 @@ def _parse_bulk_response(
         r.setdefault("conviction", 0)
         r["category"]   = category
         r["prompt_key"] = key
+        # Vocabulary guard: unknown signal (e.g. HOLD, BUY, SELL) → count as error
+        # so Fix 1's degradation tally catches it instead of scoring 0 silently.
+        sig = str(r.get("signal", "")).upper()
+        if sig not in _VALID_SIGNALS and "error" not in r:
+            r["error"] = f"invalid signal vocabulary: {r.get('signal')!r}"
+            r["signal"] = "NOTHING"
         results.append(r)
     return results
 
@@ -303,12 +327,15 @@ def _tg_shortlist(candidates: list[dict]) -> None:
 
 
 def _tg_ticker_result(ticker: str, direction: str, conviction: float,
-                       net: float, rvol: float, catalyst: str) -> None:
+                       net: float, rvol: float, catalyst: str,
+                       errored: int = 0, total: int = 0) -> None:
     icons = {"LONG": "📈", "SHORT": "📉", "NOTHING": "😴"}
+    badge = f"\n  ⚠️ {errored}/{total} analyses errored" if errored > 0 else ""
     send_message(
         f"{icons.get(direction,'❓')} <b>{ticker}</b> → <b>{direction}</b>\n"
         f"  Conviction {conviction:.0%}  |  net {net:+.4f}  |  RVOL {rvol:.1f}x\n"
         f"  {catalyst[:100]}"
+        + badge
     )
 
 
@@ -357,6 +384,30 @@ def run(
     # ── AI agents ──────────────────────────────────────────────────────────
     print("  Initialising AI agents...")
     agents = _build_agents(verbose, mock=mock)
+
+    # ── Preflight: smoke-test each agent before burning per-ticker calls ───
+    if not mock:
+        print("  Running agent preflight checks...")
+        healthy: dict = {}
+        for name, agent in agents.items():
+            if _agent_healthy(agent):
+                healthy[name] = agent
+                print(f"    [{name}] preflight OK")
+            else:
+                print(f"    [{name}] preflight FAILED")
+                send_message(f"⚠️ <b>Preflight</b>: [{name}] unavailable / not authenticated")
+        if not healthy:
+            msg = "All agents failed preflight — aborting. Check auth/rate-limits."
+            print(f"\n  {msg}")
+            send_message(f"🔴 <b>Signal Mesh</b>: {msg}")
+            return []
+        if len(healthy) < len(agents):
+            dead = set(agents) - set(healthy)
+            send_message(
+                f"⚠️ <b>Degraded mesh</b>: {', '.join(dead)} offline — "
+                f"proceeding with {', '.join(healthy)}"
+            )
+        agents = healthy
 
     # ── Market context ─────────────────────────────────────────────────────
     print("\n  Fetching market context...")
@@ -422,6 +473,41 @@ def run(
               f"(25 analyses total)...")
         round1 = _run_round1(data, agents)
 
+        # ── Mesh health check (Fix 1 + Fix 7) ─────────────────────────────
+        all_results  = [r for res in round1.values() for r in res]
+        total_calls  = len(all_results)
+        errored_calls = sum(1 for r in all_results if "error" in r)
+        per_agent_ok  = {
+            name: sum(1 for r in res if "error" not in r)
+            for name, res in round1.items()
+        }
+        err_pct  = errored_calls / total_calls if total_calls else 1.0
+        degraded = err_pct >= 0.40 or any(ok == 0 for ok in per_agent_ok.values())
+
+        # Persist health record so we can diagnose after the fact
+        health_dir = Path(config.WATCHLIST_DIR).parent / "results"
+        health_dir.mkdir(parents=True, exist_ok=True)
+        health_log = health_dir / f"mesh_health_{datetime.now(NL).strftime('%Y%m%d')}.jsonl"
+        sample_err = next(
+            (r.get("error") for r in all_results if "error" in r), None
+        )
+        with open(health_log, "a", encoding="utf-8") as _hf:
+            _hf.write(json.dumps({
+                "ticker":       ticker,
+                "per_agent_ok": per_agent_ok,
+                "errored":      errored_calls,
+                "total":        total_calls,
+                "sample_error": sample_err,
+            }) + "\n")
+
+        if degraded:
+            send_message(
+                f"⚠️ <b>{ticker}</b> mesh DEGRADED — "
+                f"{errored_calls}/{total_calls} analyses failed "
+                f"(agents OK: {per_agent_ok}). Signal unreliable — sitting out."
+            )
+            continue
+
         # Cross-pollination — capture revised signals
         print(f"  Cross-pollination...")
         revised = _run_cross_pollination(data, round1, agents)
@@ -450,7 +536,8 @@ def run(
 
         print(f"  → {direction}  net={net:+.4f}  conviction={conviction:.0%}")
         _tg_ticker_result(ticker, direction, conviction, net, rvol,
-                          data.get("catalyst_summary", ""))
+                          data.get("catalyst_summary", ""),
+                          errored=errored_calls, total=total_calls)
 
         if direction == "NOTHING":
             continue

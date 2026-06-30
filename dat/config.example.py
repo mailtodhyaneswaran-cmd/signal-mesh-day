@@ -79,6 +79,16 @@ INTRADAY_PARAMS = SimpleNamespace(
     vwap_warmup_bars      = 15,    # bars before looking for trades
     vwap_stop_atr_mult    = 1.0,   # stop distance = 1× bar ATR
 
+    # ── Conviction-modulated live RVOL gate (paper experiment) ───────────
+    # High conviction loosens the gate; low conviction tightens it.
+    # With span=0.5: 100% conviction → 1.25x gate; 0% → 1.75x.
+    # Behaves as a 2-position switch until Fix 5 (net rescaling) lands.
+    conviction_rvol_gate_enabled = False,  # flip True to run the paper experiment
+    conviction_rvol_base         = 1.5,    # centre of the swing (= orb_rvol_gate)
+    conviction_rvol_span         = 0.5,    # total swing magnitude
+    conviction_rvol_floor        = 1.0,    # gate can NEVER drop below this
+    conviction_rvol_cap          = 2.5,    # gate can NEVER rise above this
+
     # ── Cost model ────────────────────────────────────────────────────
     slippage_pct          = 0.0002,
     commission_per_share  = 0.005,

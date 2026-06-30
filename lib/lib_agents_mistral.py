@@ -117,7 +117,7 @@ class MistralAgent(BaseAgent):
                 print(f"{'─' * 60}\n")
 
             if not output:
-                return {"error": "empty response from Mistral"}
+                return {"error": "empty response from Mistral", "error_kind": "empty"}
 
             # Direct JSON parse
             try:
@@ -140,14 +140,14 @@ class MistralAgent(BaseAgent):
                 except json.JSONDecodeError:
                     pass
 
-            return {"error": "unparseable response", "raw": output[:300]}
+            return {"error": "unparseable response", "error_kind": "unparseable", "raw": output[:300]}
 
         except Exception as e:
             msg = str(e)
             is_rate_limit = "429" in msg or "rate limit" in msg.lower() or "too many requests" in msg.lower()
             if is_rate_limit and not _is_retry:
                 return self._handle_rate_limit(e, prompt)
-            return {"error": f"Mistral API error: {e}"}
+            return {"error": f"Mistral API error: {e}", "error_kind": "api_error", "exc_type": type(e).__name__}
 
     def _handle_rate_limit(self, exc: Exception, prompt: str) -> dict:
         print(f"\n[MISTRAL] Rate limited (429 Too Many Requests).")
