@@ -261,9 +261,10 @@ def run_test(
                 if skip_rvol and cap == 0:
                     print(f"  RVOL {pm_rvol:.1f}x would veto — bypassed via --skip-rvol")
                 print(f"  Agents: {list(agents.keys())}  |  RVOL cap: {cap}")
-                print(f"  Running 25 prompts × {len(agents)} agent(s)...")
-                round1 = _run_round1(prompt_data, agents)
-                agg    = _aggregate(round1, pm_rvol)
+                print(f"  Running 5 bulk calls × {len(agents)} agent(s) (25 analyses total)...")
+                round1    = _run_round1(prompt_data, agents)
+                agg_rvol  = max(pm_rvol, _DTP_PARAMS["rvol_hard_floor"]) if skip_rvol else pm_rvol
+                agg       = _aggregate(round1, agg_rvol)
                 ai_direction = agg["direction"]   # LONG | SHORT | NOTHING
                 print(f"\n  → Mesh result: {ai_direction}  (net={agg['net']:+.4f})")
                 if ai_direction == "NOTHING":
