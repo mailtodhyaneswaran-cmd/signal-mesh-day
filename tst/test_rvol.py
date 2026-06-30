@@ -174,17 +174,17 @@ def run(ticker: str, run_ai: bool = False, verbose: bool = False) -> bool:
             print("  Skipped — premarket data unavailable.")
         else:
             try:
-                from day_trading_prompts import rvol_conviction_cap, INTRADAY_PARAMS as _DTP
+                from day_trading_prompts import rvol_conviction_cap
                 from day_orchestrator import (
                     _build_agents, _run_round1,
                     _run_cross_pollination, _aggregate,
                 )
 
                 pm_rvol = float(data.get("rvol_premarket", 0))
-                cap     = rvol_conviction_cap(pm_rvol, _DTP)
+                cap     = rvol_conviction_cap(pm_rvol)
 
                 if cap == 0:
-                    print(f"  RVOL {pm_rvol:.1f}x below floor {_DTP['rvol_hard_floor']}x"
+                    print(f"  RVOL {pm_rvol:.1f}x below floor {config.INTRADAY_PARAMS.rvol_hard_floor}x"
                           f" — NOTHING veto, skipping AI")
                 else:
                     agents = _build_agents(verbose=verbose)
@@ -207,7 +207,7 @@ def run(ticker: str, run_ai: bool = False, verbose: bool = False) -> bool:
                         direction = "NOTHING"
                         net = 0.0
 
-                    thr        = _DTP["direction_threshold"]
+                    thr        = config.INTRADAY_PARAMS.direction_threshold
                     conviction = min(max(abs(net) - thr, 0) / thr, 1.0) if thr > 0 else 0.0
                     print(f"\n  ─────────────────────────────────")
                     print(f"  Result   : {direction}")

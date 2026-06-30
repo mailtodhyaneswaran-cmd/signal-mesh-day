@@ -245,16 +245,15 @@ def run_test(
     else:
         try:
             from day_orchestrator import _build_agents, _run_round1, _aggregate
-            from day_trading_prompts import (
-                INTRADAY_PARAMS as _DTP_PARAMS, rvol_conviction_cap,
-            )
+            from day_trading_prompts import rvol_conviction_cap
 
             agents  = _build_agents(verbose=verbose)
             pm_rvol = float(prompt_data.get("rvol_premarket", 0))
-            cap     = rvol_conviction_cap(pm_rvol, _DTP_PARAMS)
+            cap     = rvol_conviction_cap(pm_rvol)
 
             if cap == 0 and not skip_rvol:
-                print(f"  Premarket RVOL {pm_rvol:.1f}x < floor {_DTP_PARAMS['rvol_hard_floor']}x"
+                floor = config.INTRADAY_PARAMS.rvol_hard_floor
+                print(f"  Premarket RVOL {pm_rvol:.1f}x < floor {floor}x"
                       f" — RVOL veto  →  defaulting to LONG for order test")
                 results["5_ai_mesh"] = f"{_SKIP} (RVOL veto)"
             else:
@@ -263,7 +262,8 @@ def run_test(
                 print(f"  Agents: {list(agents.keys())}  |  RVOL cap: {cap}")
                 print(f"  Running 5 bulk calls × {len(agents)} agent(s) (25 analyses total)...")
                 round1    = _run_round1(prompt_data, agents)
-                agg_rvol  = max(pm_rvol, _DTP_PARAMS["rvol_hard_floor"]) if skip_rvol else pm_rvol
+                floor     = config.INTRADAY_PARAMS.rvol_hard_floor
+                agg_rvol  = max(pm_rvol, floor) if skip_rvol else pm_rvol
                 agg       = _aggregate(round1, agg_rvol)
                 ai_direction = agg["direction"]   # LONG | SHORT | NOTHING
                 print(f"\n  → Mesh result: {ai_direction}  (net={agg['net']:+.4f})")

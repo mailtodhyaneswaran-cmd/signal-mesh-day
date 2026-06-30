@@ -65,48 +65,8 @@ import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__)
 
 
 # ===========================================================================
-# TUNABLE PARAMETERS  — single source of truth, swept by the backtest
-# ===========================================================================
-# Every threshold, weight, and gate lives here so the backtest can tune them
-# WITHOUT touching prompt text or orchestrator logic. Nothing downstream should
-# hardcode these numbers — read them from INTRADAY_PARAMS (or a copy the backtest
-# overrides per run). To grid-search, deep-copy this dict, mutate the keys under
-# test, and pass the copy into the screener / aggregator / ORB layer.
-INTRADAY_PARAMS = {
-
-    # --- RVOL gate (TIERED, not a single cliff) ---
-    # rvol < hard_floor              -> hard NOTHING (veto, overrides everything)
-    # hard_floor <= rvol < full      -> allowed, but conviction capped at mid_cap
-    # rvol >= full                   -> allowed at full conviction
-    "rvol_hard_floor":        1.5,
-    "rvol_full_conviction":   3.0,
-    "rvol_midtier_cap":       60,   # max conviction (0-100) allowed in the mid band
-
-    # --- screener funnel (Stage 2-4: which 5 stocks) ---
-    "shortlist_size":         5,
-    "max_per_sector":         2,    # diversification cap within the 5
-    "gap_min_pct":            1.5,  # hard gate: |premarket gap| must clear this
-    "min_dollar_volume":      20_000_000,
-    "screener_weights":       {"rvol": 0.50, "gap": 0.30, "catalyst": 0.20},
-
-    # --- mesh aggregation ---
-    # net = sum(vote * (conviction/100) * category_weight); LONG=+1 SHORT=-1 NOTHING=0
-    "direction_threshold":    0.15,  # |net| must clear this for a directional call
-    "category_weights": {
-        "price_action":   0.30,
-        "quant_edge":     0.25,
-        "catalyst":       0.20,
-        "sentiment_flow": 0.15,
-        "market_regime":  0.10,
-    },
-
-    # --- trade / risk (mirrors orb_core + capital constants) ---
-    "min_reward_risk":        2.0,
-    "risk_per_trade_pct":     0.01,  # 1% of EUR5000 house money
-    "max_concurrent_positions": 3,
-    "orb_rvol_gate":          1.5,   # live RVOL gate on the breakout candle (ORB layer)
-    "tp_r_multiple":          2.0,
-}
+# All tunable parameters live in dat/config.py → INTRADAY_PARAMS (SimpleNamespace).
+# dat/config.py is the single source of truth — edit values there, not here.
 
 
 def _get(params, key):
@@ -116,7 +76,7 @@ def _get(params, key):
     return getattr(params, key)
 
 
-def rvol_conviction_cap(rvol, params=INTRADAY_PARAMS):
+def rvol_conviction_cap(rvol, params=None):
     """Tiered RVOL gate, enforced DETERMINISTICALLY by the orchestrator on the
     numeric rvol — do not rely on the LLM to self-veto. Returns the max conviction
     (0-100) allowed for this ticker; 0 means hard veto -> final signal NOTHING.
@@ -125,8 +85,12 @@ def rvol_conviction_cap(rvol, params=INTRADAY_PARAMS):
         hard_floor <= rvol < full  -> mid_cap
         rvol >= full               -> 100  (no cap)
 
-    params may be a dict (backtest) or SimpleNamespace (config.INTRADAY_PARAMS).
+    params: config.INTRADAY_PARAMS (SimpleNamespace) or a tuned dict (backtest).
+    Defaults to config.INTRADAY_PARAMS when not supplied.
     """
+    if params is None:
+        import config as _cfg
+        params = _cfg.INTRADAY_PARAMS
     if rvol < _get(params, "rvol_hard_floor"):
         return 0
     if rvol < _get(params, "rvol_full_conviction"):
@@ -790,9 +754,7 @@ def build_bulk_category_prompt(category: str, filled_prompts: list[tuple[str, st
     )
     return "\n".join(parts)
 
-# Category weights live in INTRADAY_PARAMS (single source of truth) so the backtest
-# tunes them in one place. This alias is kept for backward-compatible imports.
-INTRADAY_CATEGORY_WEIGHTS = INTRADAY_PARAMS["category_weights"]
+# Category weights live in config.INTRADAY_PARAMS (single source of truth).
 
 # Active agents: 2 for now (Claude + Mistral). Gemini is temporarily dropped — it was
 # returning malformed answers or failing/timing out before completing. Both active
@@ -839,12 +801,16 @@ AGENT_SPECIALISATIONS = {
 #    suggested_qty} into watchlist.json for the ORB engine to CONFIRM at the open.
 #
 # Reference implementation (orchestrator imports this; backtest passes a tuned params):
-def aggregate_ticker(prompt_results, rvol, params=INTRADAY_PARAMS):
+def aggregate_ticker(prompt_results, rvol, params=None):
     """Collapse all prompt votes for one ticker into a final bias. `prompt_results`
     is an iterable of dicts with keys: signal, conviction, category.
 
-    params may be a dict (backtest) or SimpleNamespace (config.INTRADAY_PARAMS).
+    params: config.INTRADAY_PARAMS (SimpleNamespace) or a tuned dict (backtest).
+    Defaults to config.INTRADAY_PARAMS when not supplied.
     """
+    if params is None:
+        import config as _cfg
+        params = _cfg.INTRADAY_PARAMS
     cap = rvol_conviction_cap(rvol, params)
     if cap == 0:
         return {"direction": "NOTHING", "net": 0.0, "rvol_veto": True}
