@@ -32,6 +32,42 @@ def connect() -> IB:
     return ib
 
 
+def get_account_summary(ib: IB, retries: int = 5, delay: float = 1.5) -> dict:
+    """Return key account metrics from the connected paper/live account.
+
+    Fetches NetLiquidation, AvailableFunds, and BuyingPower from IBKR.
+    Retries several times because accountSummary() can return empty immediately
+    after connect() while IBKR initialises the subscription.
+
+    Returns a dict with float values in USD (or account base currency).
+    On total failure: raises RuntimeError so callers can abort rather than
+    silently sizing off a zero/garbage value.
+    """
+    import time as _time
+    keys_wanted = {"NetLiquidation", "AvailableFunds", "BuyingPower"}
+    for attempt in range(retries):
+        rows = ib.accountSummary()
+        found = {
+            row.tag: float(row.value)
+            for row in rows
+            if row.tag in keys_wanted
+        }
+        if len(found) == len(keys_wanted) and all(v > 0 for v in found.values()):
+            return {
+                "net_liquidation":  found["NetLiquidation"],
+                "available_funds":  found["AvailableFunds"],
+                "buying_power":     found["BuyingPower"],
+            }
+        if attempt < retries - 1:
+            print(f"  [account] summary not ready yet (attempt {attempt+1}/{retries})"
+                  f" — retrying in {delay}s...")
+            _time.sleep(delay)
+    raise RuntimeError(
+        "get_account_summary() could not retrieve valid account data after "
+        f"{retries} attempts. Check TWS is connected and the account is active."
+    )
+
+
 def get_contract(symbol: str, exchange: str = "SMART", currency: str = "USD") -> Stock:
     return Stock(symbol, exchange, currency)
 

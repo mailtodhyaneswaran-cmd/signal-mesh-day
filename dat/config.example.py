@@ -4,6 +4,15 @@ config.py is excluded from git via .gitignore.
 """
 from types import SimpleNamespace
 
+# ── Trading profile ───────────────────────────────────────────────────────────
+# Controls how aggressively the screener and live engine apply gates.
+# Consumers read this string and look up the profile dict via:
+#   from profiles import get_profile; profile = get_profile(config.PROFILE)
+#   "strict_officer"  — all gates at full strength (current defaults)
+#   "snake_senthil"   — balanced: softer floors, fallback waterfall, half-size forced fill
+#   "try_luck"        — all gates disabled, forces 5 trades regardless of signals
+PROFILE = "strict_officer"
+
 # ── IBKR connection ───────────────────────────────────────────────────────────
 IBKR_HOST      = "127.0.0.1"
 LIVE_TRADING   = False
@@ -92,4 +101,8 @@ INTRADAY_PARAMS = SimpleNamespace(
     # ── Cost model ────────────────────────────────────────────────────
     slippage_pct          = 0.0002,
     commission_per_share  = 0.005,
+
+    # ── Notional cap (defense in depth against tight-stop / high-price sizing) ──
+    # Secondary check after risk-based qty. Set to 0.0 to disable.
+    max_notional_per_trade_pct = 0.30,  # max 30% of available_funds per trade
 )

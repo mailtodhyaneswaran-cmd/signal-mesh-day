@@ -118,11 +118,23 @@ class TradeResult:
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
-def position_size_usd(risk_usd: float, stop_distance: float) -> int:
-    """Shares = risk_budget_USD / stop_distance.  Returns 0 if stop_distance ≤ 0."""
+def position_size_usd(
+    risk_usd:        float,
+    stop_distance:   float,
+    max_notional:    float = 0.0,   # 0 = no cap
+    entry_price:     float = 0.0,   # required when max_notional > 0
+) -> int:
+    """Shares = risk_budget_USD / stop_distance, clamped by a notional cap.
+
+    max_notional > 0: qty = min(qty, floor(max_notional / entry_price)).
+    Returns 0 if stop_distance ≤ 0 or if 1 share already exceeds risk_usd.
+    """
     if stop_distance <= 0 or risk_usd <= 0:
         return 0
-    return max(0, int(risk_usd / stop_distance))
+    qty = max(0, int(risk_usd / stop_distance))
+    if max_notional > 0 and entry_price > 0:
+        qty = min(qty, int(max_notional / entry_price))
+    return qty
 
 
 def rvol(
@@ -212,16 +224,18 @@ def confirm_retest(orng: OpeningRange, bar: Bar, cfg: ORBConfig, direction: str)
 
 
 def build_bracket(
-    orng:      OpeningRange,
-    entry:     float,
-    direction: str,
-    cfg:       ORBConfig,
-    risk_usd:  float,
+    orng:            OpeningRange,
+    entry:           float,
+    direction:       str,
+    cfg:             ORBConfig,
+    risk_usd:        float,
+    max_notional:    float = 0.0,   # 0 = no cap; pass available_funds * pct
 ) -> dict:
     """Compute bracket levels and position size.
 
     Returns dict with keys: entry, stop, take_profit, qty, risk_per_share.
-    qty=0 means the setup should be skipped (1 share exceeds risk budget).
+    qty=0 means the setup should be skipped (1 share exceeds risk budget or
+    notional cap leaves 0 shares).
     """
     slip = cfg.slippage_pct * entry
 
@@ -236,7 +250,7 @@ def build_bracket(
         risk         = stop - entry_filled
         take_profit  = entry_filled - cfg.tp_r_multiple * risk
 
-    qty = position_size_usd(risk_usd, risk) if risk > 0 else 0
+    qty = position_size_usd(risk_usd, risk, max_notional, entry_filled) if risk > 0 else 0
 
     return {
         "entry":          round(entry_filled, 2),

@@ -27,17 +27,18 @@ from zoneinfo import ZoneInfo
 import config
 import ibkr_connector
 from orb_core import (
-    ORBConfig, Bar, capture_opening_range,
-    detect_breakout, confirm_retest, build_bracket,
+    ORBConfig, Bar, OpeningRange, capture_opening_range,
+    detect_breakout, confirm_retest, build_bracket, position_size_usd,
 )
+from profiles import get_profile
 from telegram_notify import send_message
 from vwap_strategy import VWAPConfig, compute_vwap, detect_vwap_setup
 
 # Re-use all shared helpers from orb_strategy (don't duplicate)
 from orb_strategy import (
     _SIGNAL_TO_DIRECTION,
-    _risk_usd, _today_at, _wait_until,
-    _load_state, _save_state,
+    _risk_usd, _max_notional, _today_at, _wait_until,
+    _load_state, _save_state, _force_fill,
     _monitor_bracket, _eod_safety_flatten,
     run_ticker_orb,
 )
@@ -59,13 +60,23 @@ US_VWAP_WINDOW_END = "20:00"  # 14:00 ET — stop VWAP reversion
 
 # ── IB session runner ─────────────────────────────────────────────────────────
 
-def run_ticker_ib(pick: dict, ib, state: dict, state_lock: threading.Lock) -> None:
+def run_ticker_ib(
+    pick:            dict,
+    ib,
+    state:           dict,
+    state_lock:      threading.Lock,
+    profile:         dict | None = None,
+    account_summary: dict | None = None,
+) -> None:
     """60-min Initial Balance Breakout session for one ticker.
 
     Waits for the first 60 minutes of trading to close (10:30 ET),
     captures the IB range, then watches for a breakout + retest using
     the same orb_core primitives as ORB — just with a wider range.
     """
+    if profile is None:
+        profile = get_profile(config.PROFILE)
+
     ticker      = pick["ticker"]
     signal      = pick.get("signal", "HOLD")
     direction   = _SIGNAL_TO_DIRECTION.get(signal, "skip")
@@ -118,22 +129,34 @@ def run_ticker_ib(pick: dict, ib, state: dict, state_lock: threading.Lock) -> No
 
     # Build ORBConfig tuned for IB (60-min range, RVOL disabled)
     cfg = ORBConfig.from_params(config.INTRADAY_PARAMS)
-    cfg.range_minutes = len(ib_bars)   # however many bars we actually got
+    cfg.range_minutes = len(ib_bars)
     cfg.rvol_mode     = "disabled"
     cfg.rvol_min      = 0.0
 
+    # Apply profile overrides
+    min_range_override = profile.get("min_range_pct_override")
+    if min_range_override is not None:
+        cfg.min_range_pct = min_range_override
+    require_retest = profile.get("require_retest")
+    if require_retest is not None:
+        cfg.require_retest = require_retest
+
     orng = capture_opening_range(ib_bars, cfg, ticker)
     if orng is None:
-        msg = f"😴 {ticker} IB range too thin — skipping."
+        msg = f"😴 {ticker} IB range too thin — {'forcing entry' if profile.get('force_trade') else 'skipping'}"
         print(msg); send_message(msg)
-        return
+        if not profile.get("force_trade"):
+            return
+        orng = OpeningRange(ticker=ticker,
+                            high=max(b.high for b in ib_bars),
+                            low=min(b.low  for b in ib_bars))
 
     send_message(
         f"📊 <b>{ticker}</b> IB range: {orng.low:.2f}–{orng.high:.2f} {currency}"
         f"  ·  bias: {direction.upper()}"
     )
 
-    # ── Poll 1-min bars for breakout → retest (same as ORB) ──────────────
+    # ── Poll 1-min bars for breakout → retest ────────────────────────────
     direction_confirmed = None
     polls_per_sec       = config.INTRADAY_PARAMS.poll_interval_sec
 
@@ -153,6 +176,30 @@ def run_ticker_ib(pick: dict, ib, state: dict, state_lock: threading.Lock) -> No
             if detect_breakout(orng, bar, direction):
                 direction_confirmed = direction
                 lvl = orng.high if direction == "long" else orng.low
+
+                if not cfg.require_retest:
+                    bracket = build_bracket(orng, lvl, direction_confirmed, cfg,
+                                            _risk_usd(account_summary), _max_notional(account_summary))
+                    if bracket["qty"] == 0:
+                        send_message(f"⚠️ {ticker} IB qty=0 — skipping.")
+                        return
+                    action = "BUY" if direction_confirmed == "long" else "SELL"
+                    trades = ibkr_connector.place_bracket_order(
+                        ib, contract, action, bracket["qty"],
+                        bracket["entry"], bracket["take_profit"], bracket["stop"],
+                    )
+                    send_message(
+                        f"✅ IB {'Long' if direction_confirmed=='long' else 'Short'} <b>{ticker}</b>  "
+                        f"entry {bracket['entry']:.2f}  SL {bracket['stop']:.2f}  "
+                        f"TP {bracket['take_profit']:.2f}  qty {bracket['qty']}"
+                    )
+                    with state_lock:
+                        state["trades"][ticker] = True
+                        _save_state(state)
+                    _monitor_bracket(ib, contract, trades, direction_confirmed,
+                                     bracket, orng, ticker, currency, session_end)
+                    return
+
                 send_message(
                     f"{'📈' if direction=='long' else '📉'} <b>{ticker}</b> IB "
                     f"broke {'above' if direction=='long' else 'below'} {lvl:.2f} "
@@ -161,15 +208,17 @@ def run_ticker_ib(pick: dict, ib, state: dict, state_lock: threading.Lock) -> No
         else:
             retest = confirm_retest(orng, bar, cfg, direction_confirmed)
             if retest is False:
-                send_message(f"⚠️ {ticker} IB failed retest — skipping today.")
-                return
-            if retest is True:
+                if cfg.require_retest:
+                    send_message(f"⚠️ {ticker} IB failed retest — skipping today.")
+                    return
+                direction_confirmed = None
+            elif retest is True:
                 entry_price = orng.high if direction_confirmed == "long" else orng.low
-                bracket     = build_bracket(orng, entry_price, direction_confirmed, cfg, _risk_usd())
+                bracket     = build_bracket(orng, entry_price, direction_confirmed, cfg,
+                                            _risk_usd(account_summary), _max_notional(account_summary))
                 if bracket["qty"] == 0:
                     send_message(f"⚠️ {ticker} IB qty=0 (stop too wide) — skipping.")
                     return
-
                 action = "BUY" if direction_confirmed == "long" else "SELL"
                 trades = ibkr_connector.place_bracket_order(
                     ib, contract, action, bracket["qty"],
@@ -189,17 +238,31 @@ def run_ticker_ib(pick: dict, ib, state: dict, state_lock: threading.Lock) -> No
 
         time.sleep(polls_per_sec)
 
-    send_message(f"😴 {ticker} IB — no clean setup by {US_IB_WINDOW_END} NL, standing aside.")
+    if profile.get("force_trade"):
+        _force_fill(ticker, ib, contract, orng, direction, cfg, profile,
+                    account_summary, state, state_lock, session_end, currency)
+    else:
+        send_message(f"😴 {ticker} IB — no clean setup by {US_IB_WINDOW_END} NL, standing aside.")
 
 
 # ── VWAP session runner ───────────────────────────────────────────────────────
 
-def run_ticker_vwap(pick: dict, ib, state: dict, state_lock: threading.Lock) -> None:
+def run_ticker_vwap(
+    pick:            dict,
+    ib,
+    state:           dict,
+    state_lock:      threading.Lock,
+    profile:         dict | None = None,
+    account_summary: dict | None = None,
+) -> None:
     """VWAP Reversion session for one ticker.
 
     Polls 1-min bars from open, computes running VWAP, and enters when
     price deviates >= vwap_min_deviation% away with a reversal confirmation.
     """
+    if profile is None:
+        profile = get_profile(config.PROFILE)
+
     ticker      = pick["ticker"]
     signal      = pick.get("signal", "HOLD")
     direction   = _SIGNAL_TO_DIRECTION.get(signal, "skip")
@@ -299,8 +362,8 @@ def run_ticker_vwap(pick: dict, ib, state: dict, state_lock: threading.Lock) -> 
             time.sleep(polls_per_sec)
             continue
 
-        from orb_core import position_size_usd, OpeningRange
-        qty = position_size_usd(_risk_usd(), risk)
+        qty = position_size_usd(_risk_usd(account_summary), risk,
+                                _max_notional(account_summary), entry_f)
         if qty == 0:
             send_message(f"⚠️ {ticker} VWAP qty=0 (stop too wide) — skipping.")
             time.sleep(polls_per_sec)
@@ -319,15 +382,23 @@ def run_ticker_vwap(pick: dict, ib, state: dict, state_lock: threading.Lock) -> 
             state["trades"][ticker] = True
             _save_state(state)
 
-        # Reuse ORB monitoring — TP/SL/re-entry work the same way
-        # Build a stub OpeningRange so _monitor_bracket re-entry check works
         fake_orng = OpeningRange(ticker=ticker, high=vwap_level, low=vwap_level - risk)
         bracket   = {"entry": entry_f, "take_profit": tp, "stop": stop, "qty": qty}
         _monitor_bracket(ib, contract, trades, setup_dir,
                          bracket, fake_orng, ticker, currency, session_end)
         return
 
-    send_message(f"😴 {ticker} VWAP — no setup by {US_VWAP_WINDOW_END} NL.")
+    if profile.get("force_trade"):
+        # Use the last known VWAP level (or mid of bar_history) for the synthetic range
+        last_bars  = bar_history[-5:] if len(bar_history) >= 5 else bar_history
+        fake_high  = max(b.high for b in last_bars) if last_bars else 0
+        fake_low   = min(b.low  for b in last_bars) if last_bars else 0
+        fake_orng  = OpeningRange(ticker=ticker, high=fake_high, low=fake_low)
+        cfg_orb    = ORBConfig.from_params(config.INTRADAY_PARAMS)
+        _force_fill(ticker, ib, contract, fake_orng, direction if direction != "skip" else "long",
+                    cfg_orb, profile, account_summary, state, state_lock, session_end, currency)
+    else:
+        send_message(f"😴 {ticker} VWAP — no setup by {US_VWAP_WINDOW_END} NL.")
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
@@ -340,10 +411,12 @@ _DISPATCH = {
 
 
 def main() -> None:
+    profile = get_profile(config.PROFILE)
+
     print(f"\n{'='*58}")
     print(f"  Signal Mesh Day — Live Engine")
     print(f"  {datetime.now(NL).strftime('%Y-%m-%d %H:%M')} NL")
-    print(f"  LIVE_TRADING = {config.LIVE_TRADING}")
+    print(f"  LIVE_TRADING = {config.LIVE_TRADING}  |  PROFILE = {config.PROFILE}")
     print(f"{'='*58}\n")
 
     # Load watchlist and read strategy chosen by regime detection
@@ -358,8 +431,12 @@ def main() -> None:
             strategy = json.load(f).get("strategy", "ORB").upper()
 
     if strategy == "SIT_OUT":
-        send_message("😴 Regime says SIT_OUT — no trades today.")
-        return
+        if not profile.get("allow_sit_out", True):
+            strategy = "VWAP"
+            send_message(f"⚠️ Regime says SIT_OUT but profile={config.PROFILE} forces VWAP.")
+        else:
+            send_message("😴 Regime says SIT_OUT — no trades today.")
+            return
 
     runner = _DISPATCH.get(strategy, run_ticker_orb)
     print(f"  Strategy today: {strategy}  (runner: {runner.__name__})")
@@ -369,11 +446,15 @@ def main() -> None:
         if _SIGNAL_TO_DIRECTION.get(p.get("signal", "HOLD"), "skip") != "skip"
     ]
     if not actionable:
-        send_message("😴 No actionable picks in today's watchlist (all HOLD).")
-        return
+        if not profile.get("force_trade"):
+            send_message("😴 No actionable picks in today's watchlist (all HOLD).")
+            return
+        send_message(f"⚠️ No actionable picks — profile={config.PROFILE} will force-fill at deadline.")
+        # Re-include all picks; force_fill in the runner handles the rest
+        actionable = picks
 
     send_message(
-        f"🚀 <b>Live Engine — {strategy}</b>  ·  {len(actionable)} pick(s)\n"
+        f"🚀 <b>Live Engine — {strategy}</b>  ·  profile={config.PROFILE}  ·  {len(actionable)} pick(s)\n"
         + "\n".join(
             f"  {'📈' if p.get('signal')=='BUY' else '📉'} {p['ticker']}  "
             f"{_SIGNAL_TO_DIRECTION.get(p.get('signal','HOLD'),'skip').upper()}"
@@ -388,14 +469,26 @@ def main() -> None:
         print(msg); send_message(msg)
         return
 
+    # Fetch live account data once — passed into every runner thread for sizing
+    account_summary: dict | None = None
+    try:
+        account_summary = ibkr_connector.get_account_summary(ib)
+        print(f"  Account  NLV ${account_summary['net_liquidation']:,.0f}  "
+              f"available ${account_summary['available_funds']:,.0f}")
+    except Exception as e:
+        msg = f"⚠️ Cannot read account summary: {e}. Sizing falls back to config.HOUSE_MONEY_EUR."
+        print(msg); send_message(msg)
+
     state      = _load_state()
     state_lock = threading.Lock()
+    max_picks  = profile.get("max_picks", config.MAX_CONCURRENT_POSITIONS)
 
     threads: list[threading.Thread] = []
-    for pick in actionable[:config.MAX_CONCURRENT_POSITIONS]:
+    for pick in actionable[:max_picks]:
         t = threading.Thread(
             target=runner,
             args=(pick, ib, state, state_lock),
+            kwargs={"profile": profile, "account_summary": account_summary},
             name=f"{strategy}-{pick['ticker']}",
             daemon=True,
         )

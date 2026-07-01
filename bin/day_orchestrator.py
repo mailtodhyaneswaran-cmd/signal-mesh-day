@@ -42,6 +42,7 @@ from zoneinfo import ZoneInfo
 _VALID_SIGNALS = {"LONG", "SHORT", "NOTHING"}
 
 import config
+from profiles import get_profile
 
 # Set Mistral API key from config before importing the agent
 os.environ.setdefault("MISTRAL_API_KEY", getattr(config, "MISTRAL_API_KEY", ""))
@@ -377,10 +378,11 @@ def run(
         tickers_override: if set, skip the screener and use these tickers.
         verbose: print full prompt + response for every AI call.
     """
-    params = config.INTRADAY_PARAMS
+    params  = config.INTRADAY_PARAMS
+    profile = get_profile(config.PROFILE)
     print(f"\n{'='*58}")
     print(f"  Signal Mesh Day — AI Screener  "
-          f"{datetime.now(NL).strftime('%Y-%m-%d %H:%M')} NL")
+          f"{datetime.now(NL).strftime('%Y-%m-%d %H:%M')} NL  |  profile={config.PROFILE}")
     print(f"{'='*58}\n")
 
     # ── EUR/USD rate ───────────────────────────────────────────────────────
@@ -468,9 +470,18 @@ def run(
         rvol = float(data.get("rvol_premarket", 0))
 
         # Hard RVOL veto before running expensive prompts
-        cap = rvol_conviction_cap(rvol, config.INTRADAY_PARAMS)
-        if cap == 0:
-            floor = config.INTRADAY_PARAMS.rvol_hard_floor
+        # Profile may bypass entirely or use a softer floor via rvol_hard_floor_override.
+        rvol_floor_override = profile.get("rvol_hard_floor_override")
+        if rvol_floor_override is not None:
+            _veto_params = type("P", (), {k: v for k, v in vars(config.INTRADAY_PARAMS).items()})()
+            _veto_params.rvol_hard_floor    = rvol_floor_override
+            _veto_params.rvol_full_conviction = config.INTRADAY_PARAMS.rvol_full_conviction
+            _veto_params.rvol_midtier_cap     = config.INTRADAY_PARAMS.rvol_midtier_cap
+            cap = rvol_conviction_cap(rvol, _veto_params)
+        else:
+            cap = rvol_conviction_cap(rvol, config.INTRADAY_PARAMS)
+        if cap == 0 and not profile.get("bypass_rvol_screener_veto"):
+            floor = rvol_floor_override if rvol_floor_override is not None else config.INTRADAY_PARAMS.rvol_hard_floor
             print(f"  ⛔ RVOL {rvol:.1f}x < {floor}x — veto, skipping")
             send_message(f"⛔ <b>{ticker}</b>: RVOL {rvol:.1f}x below floor {floor}x — skipped")
             continue
@@ -528,22 +539,31 @@ def run(
         direction = agg["direction"]   # "LONG" | "SHORT" | "NOTHING"
         net       = agg["net"]
 
-        # Cross-poll consensus override: if ALL agents revised to NOTHING,
-        # the deliberation vetoed the round-1 signal — trust it.
+        # Gate 2 — Cross-poll consensus override
         cp_signals = [
             r.get("revised_signal", direction)
             for r in revised.values()
             if "error" not in r
         ]
-        if cp_signals and direction != "NOTHING" and all(s == "NOTHING" for s in cp_signals):
+        if (profile.get("respect_cross_poll_override", True)
+                and cp_signals and direction != "NOTHING"
+                and all(s == "NOTHING" for s in cp_signals)):
             print(f"  ⚠️  Cross-poll consensus: all agents revised to NOTHING "
                   f"(overrides round-1 {direction})")
             direction = "NOTHING"
             net       = 0.0
 
         # Conviction: 0% at threshold, 100% at 2× threshold and above
-        thr        = config.INTRADAY_PARAMS.direction_threshold
-        conviction = min(max(abs(net) - thr, 0) / thr, 1.0) if thr > 0 else 0.0
+        thr_override = profile.get("direction_threshold_override")
+        thr          = thr_override if thr_override is not None else config.INTRADAY_PARAMS.direction_threshold
+        conviction   = min(max(abs(net) - thr, 0) / thr, 1.0) if thr > 0 else 1.0
+
+        # Gate 3 — force direction when AI says NOTHING
+        if direction == "NOTHING" and profile.get("force_direction_on_nothing"):
+            gap_pct   = float(data.get("premarket_gap_pct", 0) or 0)
+            direction = "LONG" if gap_pct >= 0 else "SHORT"
+            conviction = 0.01   # minimal conviction — flagged as forced
+            print(f"  ⚠️  AI said NOTHING — profile forces {direction} from gap {gap_pct:+.2f}%")
 
         print(f"  → {direction}  net={net:+.4f}  conviction={conviction:.0%}")
         _tg_ticker_result(ticker, direction, conviction, net, rvol,
@@ -586,6 +606,12 @@ def run(
     ]
     strategy_name, regime_score = pick_strategy(mkt_ctx, enriched_candidates, params)
     print(f"\n  Regime scores — {regime_score}")
+
+    # Gate 4 — SIT_OUT bypass
+    if strategy_name == "SIT_OUT" and not profile.get("allow_sit_out", True):
+        strategy_name = "VWAP"
+        print(f"  ⚠️  Regime says SIT_OUT but profile={config.PROFILE} forces VWAP")
+
     print(f"  Strategy for today: {strategy_name}"
           f"  (fallback window: {FALLBACK_WINDOW_NL.get(strategy_name, 'n/a')} NL)")
     send_message(
@@ -596,9 +622,10 @@ def run(
            if strategy_name in FALLBACK_WINDOW_NL else "")
     )
 
-    # ── Sort by confidence, keep top MAX_CONCURRENT_POSITIONS ─────────────
+    # Gate 5 — max_picks from profile
+    max_picks = profile.get("max_picks", config.MAX_CONCURRENT_POSITIONS)
     picks.sort(key=lambda x: x["confidence"], reverse=True)
-    picks = picks[: config.MAX_CONCURRENT_POSITIONS]
+    picks = picks[:max_picks]
 
     # ── Write watchlist + notify ───────────────────────────────────────────
     _write_watchlist(picks, eurusd, strategy=strategy_name)
