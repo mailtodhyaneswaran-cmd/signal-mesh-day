@@ -67,6 +67,7 @@ def run_ticker_ib(
     state_lock:      threading.Lock,
     profile:         dict | None = None,
     account_summary: dict | None = None,
+    stagger_index:   int = 0,
 ) -> None:
     """60-min Initial Balance Breakout session for one ticker.
 
@@ -100,16 +101,30 @@ def run_ticker_ib(
     # ── Wait for 60-min IB range to close ────────────────────────────────
     _wait_until(_today_at(US_IB_RANGE_END))
 
+    # Stagger requests so 5 concurrent threads don't all hit IBKR at the same
+    # second (thundering herd causes Error 366 / timeout for all of them).
+    if stagger_index > 0:
+        time.sleep(stagger_index * 3)
+
     contract = ibkr_connector.get_contract(ticker, "SMART", currency)
 
-    # Fetch the 60 x 1-min RTH bars that formed the IB range
-    ib_bars_raw = ib.reqHistoricalData(
-        contract, endDateTime="", durationStr="3600 S",
-        barSizeSetting="1 min", whatToShow="TRADES",
-        useRTH=True, formatDate=1,
-    )
+    # Fetch the 60 x 1-min RTH bars that formed the IB range — retry up to 5×
+    # because IBKR sometimes needs a moment to serve historical data at open.
+    ib_bars_raw = None
+    for attempt in range(5):
+        ib_bars_raw = ib.reqHistoricalData(
+            contract, endDateTime="", durationStr="3600 S",
+            barSizeSetting="1 min", whatToShow="TRADES",
+            useRTH=True, formatDate=1,
+        )
+        if ib_bars_raw:
+            break
+        if attempt < 4:
+            print(f"  [{ticker}] IB bars not ready (attempt {attempt+1}/5) — retrying in 5s...")
+            time.sleep(5)
+
     if not ib_bars_raw:
-        msg = f"⚠️ {ticker}: no IB range bars available — skipping."
+        msg = f"⚠️ {ticker}: no IB range bars after 5 attempts — skipping."
         print(msg); send_message(msg)
         return
 
@@ -484,11 +499,14 @@ def main() -> None:
     max_picks  = profile.get("max_picks", config.MAX_CONCURRENT_POSITIONS)
 
     threads: list[threading.Thread] = []
-    for pick in actionable[:max_picks]:
+    for i, pick in enumerate(actionable[:max_picks]):
+        # IB runner staggers its reqHistoricalData calls to avoid IBKR throttle.
+        # Other runners don't do bulk historical fetches so stagger is not needed.
+        extra = {"stagger_index": i} if strategy == "IB" else {}
         t = threading.Thread(
             target=runner,
             args=(pick, ib, state, state_lock),
-            kwargs={"profile": profile, "account_summary": account_summary},
+            kwargs={"profile": profile, "account_summary": account_summary, **extra},
             name=f"{strategy}-{pick['ticker']}",
             daemon=True,
         )
