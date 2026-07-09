@@ -47,6 +47,10 @@ NL             = ZoneInfo("Europe/Amsterdam")
 US_OPEN        = "15:30"   # 09:30 ET
 US_SESSION_END = "22:00"   # 16:00 ET — hard EOD flatten
 
+# Serialise all reqHistoricalData calls across threads — IBKR pacing rules
+# require that requests don't overlap (concurrent calls return Error 366).
+_IB_HIST_LOCK = threading.Lock()
+
 # ORB timings
 US_ORB_WINDOW_END  = "19:00"  # 13:00 ET — stop looking for ORB breakout
 
@@ -101,35 +105,53 @@ def run_ticker_ib(
     # ── Wait for 60-min IB range to close ────────────────────────────────
     _wait_until(_today_at(US_IB_RANGE_END))
 
-    # Give IBKR 90s to finalize the 10:30 ET bar before requesting.
-    # Requesting at exactly 16:30:00 NL consistently returns empty because
-    # IBKR hasn't finished aggregating that final candle yet.
+    # Give IBKR 90s to finalize the 10:30 ET bar before any request.
     time.sleep(90)
 
-    # Stagger requests so 5 concurrent threads don't all hit IBKR at the same
-    # second (thundering herd causes Error 366 / timeout for all of them).
+    # Stagger so threads don't all reach the lock simultaneously.
     if stagger_index > 0:
         time.sleep(stagger_index * 5)
 
     contract = ibkr_connector.get_contract(ticker, "SMART", currency)
 
-    # Fetch the IB range bars — 65-min window so boundary timing never clips
-    # the first or last bar. Retry up to 10× with 10s gaps.
+    # Qualify the contract — without this IBKR can't resolve the exact
+    # exchange/conId and returns Error 366 for every historical request.
+    try:
+        ib.qualifyContracts(contract)
+        print(f"  [{ticker}] contract qualified: conId={contract.conId} "
+              f"exchange={contract.primaryExchange}")
+    except Exception as e:
+        print(f"  [{ticker}] qualifyContracts failed ({e}) — continuing unqualified")
+
+    # Fetch IB range bars.  Requests are serialised via _IB_HIST_LOCK so
+    # concurrent threads never call reqHistoricalData at the same time
+    # (IBKR pacing rules return Error 366 for overlapping requests).
+    # Use 8-hour duration matching test_live_order.py which reliably works.
     ib_bars_raw = None
     for attempt in range(10):
-        ib_bars_raw = ib.reqHistoricalData(
-            contract, endDateTime="", durationStr="3900 S",
-            barSizeSetting="1 min", whatToShow="TRADES",
-            useRTH=True, formatDate=1,
-        )
+        with _IB_HIST_LOCK:
+            try:
+                ib_bars_raw = ib.reqHistoricalData(
+                    contract, endDateTime="", durationStr="28800 S",
+                    barSizeSetting="1 min", whatToShow="TRADES",
+                    useRTH=True, formatDate=1,
+                )
+                n = len(ib_bars_raw) if ib_bars_raw else 0
+                print(f"  [{ticker}] reqHistoricalData attempt {attempt+1}/10: {n} bars returned")
+            except Exception as e:
+                print(f"  [{ticker}] reqHistoricalData attempt {attempt+1}/10 "
+                      f"exception: {type(e).__name__}: {e}")
+                ib_bars_raw = None
         if ib_bars_raw:
             break
         if attempt < 9:
-            print(f"  [{ticker}] IB bars not ready (attempt {attempt+1}/10) — retrying in 10s...")
-            time.sleep(10)
+            print(f"  [{ticker}] bars empty — retrying in 15s...")
+            time.sleep(15)
 
     if not ib_bars_raw:
-        msg = f"⚠️ {ticker}: no IB range bars after 10 attempts — skipping."
+        msg = (f"⚠️ {ticker}: no IB range bars after 10 attempts. "
+               f"Contract: {contract}. Check TWS market data subscriptions "
+               f"and that qualifyContracts succeeded above.")
         print(msg); send_message(msg)
         return
 
