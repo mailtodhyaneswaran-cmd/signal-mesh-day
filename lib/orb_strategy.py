@@ -151,7 +151,7 @@ def _wait_until(target: datetime) -> None:
         time.sleep(min(remaining, 30))
 
 
-def _load_watchlist(wait_minutes: int = 10) -> list[dict]:
+def _load_watchlist(wait_minutes: int = 30) -> list[dict]:
     """Load today's watchlist_YYYYMMDD.json from WATCHLIST_DIR.
 
     If the file doesn't exist yet (screener still running), waits up to

@@ -101,30 +101,35 @@ def run_ticker_ib(
     # ── Wait for 60-min IB range to close ────────────────────────────────
     _wait_until(_today_at(US_IB_RANGE_END))
 
+    # Give IBKR 90s to finalize the 10:30 ET bar before requesting.
+    # Requesting at exactly 16:30:00 NL consistently returns empty because
+    # IBKR hasn't finished aggregating that final candle yet.
+    time.sleep(90)
+
     # Stagger requests so 5 concurrent threads don't all hit IBKR at the same
     # second (thundering herd causes Error 366 / timeout for all of them).
     if stagger_index > 0:
-        time.sleep(stagger_index * 3)
+        time.sleep(stagger_index * 5)
 
     contract = ibkr_connector.get_contract(ticker, "SMART", currency)
 
-    # Fetch the 60 x 1-min RTH bars that formed the IB range — retry up to 5×
-    # because IBKR sometimes needs a moment to serve historical data at open.
+    # Fetch the IB range bars — 65-min window so boundary timing never clips
+    # the first or last bar. Retry up to 10× with 10s gaps.
     ib_bars_raw = None
-    for attempt in range(5):
+    for attempt in range(10):
         ib_bars_raw = ib.reqHistoricalData(
-            contract, endDateTime="", durationStr="3600 S",
+            contract, endDateTime="", durationStr="3900 S",
             barSizeSetting="1 min", whatToShow="TRADES",
             useRTH=True, formatDate=1,
         )
         if ib_bars_raw:
             break
-        if attempt < 4:
-            print(f"  [{ticker}] IB bars not ready (attempt {attempt+1}/5) — retrying in 5s...")
-            time.sleep(5)
+        if attempt < 9:
+            print(f"  [{ticker}] IB bars not ready (attempt {attempt+1}/10) — retrying in 10s...")
+            time.sleep(10)
 
     if not ib_bars_raw:
-        msg = f"⚠️ {ticker}: no IB range bars after 5 attempts — skipping."
+        msg = f"⚠️ {ticker}: no IB range bars after 10 attempts — skipping."
         print(msg); send_message(msg)
         return
 
