@@ -137,15 +137,15 @@ def run_ticker_ib(
                     useRTH=True, formatDate=1,
                 )
                 n = len(ib_bars_raw) if ib_bars_raw else 0
-                print(f"  [{ticker}] reqHistoricalData attempt {attempt+1}/10: {n} bars returned")
+                print(f"  [{_ts()}] [{ticker}] reqHistoricalData attempt {attempt+1}/10: {n} bars")
             except Exception as e:
-                print(f"  [{ticker}] reqHistoricalData attempt {attempt+1}/10 "
-                      f"exception: {type(e).__name__}: {e}")
+                print(f"  [{_ts()}] [{ticker}] reqHistoricalData attempt {attempt+1}/10 "
+                      f"EXCEPTION: {type(e).__name__}: {e}")
                 ib_bars_raw = None
         if ib_bars_raw:
             break
         if attempt < 9:
-            print(f"  [{ticker}] bars empty — retrying in 15s...")
+            print(f"  [{_ts()}] [{ticker}] bars empty — retrying in 15s...")
             time.sleep(15)
 
     if not ib_bars_raw:
@@ -153,6 +153,18 @@ def run_ticker_ib(
                f"Contract: {contract}. Check TWS market data subscriptions "
                f"and that qualifyContracts succeeded above.")
         print(msg); send_message(msg)
+        # try_luck: bars unavailable → synthetic force-fill rather than giving up
+        if profile.get("force_trade") and not state["trades"].get(ticker):
+            last_bar = ibkr_connector.get_latest_closed_1min_bar(ib, contract)
+            if last_bar:
+                p = last_bar.close
+                synth_orng = OpeningRange(ticker=ticker,
+                                          high=round(p * 1.005, 2),
+                                          low=round(p * 0.995, 2))
+                print(f"  [{ticker}] IB bars unavailable — forcing synthetic entry at {p:.2f}")
+                _force_fill(ticker, ib, contract, synth_orng, direction,
+                            ORBConfig.from_params(config.INTRADAY_PARAMS),
+                            profile, account_summary, state, state_lock, session_end, currency)
         return
 
     # Filter to bars from 15:30–16:30 NL (09:30–10:30 ET)
@@ -452,14 +464,19 @@ _DISPATCH = {
 }
 
 
+def _ts() -> str:
+    """Current NL time as HH:MM:SS for inline log timestamps."""
+    return datetime.now(NL).strftime("%H:%M:%S")
+
+
 def main() -> None:
     profile = get_profile(config.PROFILE)
 
-    print(f"\n{'='*58}")
+    print(f"\n{'='*60}")
     print(f"  Signal Mesh Day — Live Engine")
     print(f"  {datetime.now(NL).strftime('%Y-%m-%d %H:%M')} NL")
-    print(f"  LIVE_TRADING = {config.LIVE_TRADING}  |  PROFILE = {config.PROFILE}")
-    print(f"{'='*58}\n")
+    print(f"  LIVE_TRADING={config.LIVE_TRADING}  PROFILE={config.PROFILE}")
+    print(f"{'='*60}\n")
 
     # Load watchlist and read strategy chosen by regime detection
     from orb_strategy import _load_watchlist
@@ -481,7 +498,7 @@ def main() -> None:
             return
 
     runner = _DISPATCH.get(strategy, run_ticker_orb)
-    print(f"  Strategy today: {strategy}  (runner: {runner.__name__})")
+    print(f"  [{_ts()}] Strategy: {strategy}  runner: {runner.__name__}")
 
     actionable = [
         p for p in picks
@@ -539,7 +556,7 @@ def main() -> None:
         )
         t.start()
         threads.append(t)
-        print(f"  [{pick['ticker']}] {strategy} thread started")
+        print(f"  [{_ts()}] [{pick['ticker']}] {strategy} thread started")
 
     for t in threads:
         t.join()

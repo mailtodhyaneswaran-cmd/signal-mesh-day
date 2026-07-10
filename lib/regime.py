@@ -45,15 +45,23 @@ class RegimeScore:
     vwap: int = 0
 
     def winner(self) -> str:
-        """Return the highest-scoring strategy.  Tie-break: VWAP > IB > ORB."""
+        """Return the highest-scoring strategy.  Tie-break: VWAP > ORB > IB.
+
+        ORB is preferred over IB on a tie because:
+        - ORB fires at 09:30 ET and needs only the 5-min opening bar (highly
+          available even during IBKR data-service load spikes).
+        - IB fires at 10:30 ET and requires a bulk 60-min historical fetch
+          that has been consistently failing when multiple tickers are requested
+          concurrently on the paper account.
+        """
         best = max(self.orb, self.ib, self.vwap)
         if best == 0:
             return "SIT_OUT"
         if self.vwap == best:
             return "VWAP"
-        if self.ib == best:
-            return "IB"
-        return "ORB"
+        if self.orb == best:
+            return "ORB"
+        return "IB"
 
     def __str__(self) -> str:
         return f"ORB={self.orb}  IB={self.ib}  VWAP={self.vwap}"
