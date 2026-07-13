@@ -23,10 +23,40 @@ import config
 import ibkr_connector
 from telegram_notify import send_message
 
-NL = ZoneInfo("Europe/Amsterdam")
+NL  = ZoneInfo("Europe/Amsterdam")
+_ET = ZoneInfo("America/New_York")
 
 # Signal → direction mapping (shared vocabulary across the watchlist schema)
 _SIGNAL_TO_DIRECTION = {"BUY": "long", "SELL": "short", "HOLD": "skip"}
+
+# ── ET session anchors — the SINGLE source of truth for session timing ────────
+# US market events are defined in New York time and converted to NL wall-clock at
+# runtime, so the ~2–3 weeks/year when EU and US DST switch on different dates
+# (offset temporarily 5h or 7h instead of 6h) never desync the bot. Hardcoding
+# NL strings like "15:30" broke the opening-bar match during those windows.
+ET_OPEN            = "09:30"   # regular session open
+ET_ORB_RANGE_END   = "09:35"   # 5-min opening range closes
+ET_ORB_WINDOW_END  = "13:00"   # ORB: stop looking for a setup
+ET_IB_RANGE_END    = "10:30"   # 60-min Initial Balance range closes
+ET_IB_WINDOW_END   = "11:00"   # IB: stop looking for a setup
+ET_VWAP_WINDOW_END = "14:00"   # VWAP: stop looking for a setup
+ET_SESSION_END     = "16:00"   # hard EOD flatten
+
+
+def _et_today_at(et_hhmm: str) -> datetime:
+    """NL-aware datetime for today's ET session time (DST-correct)."""
+    h, m  = map(int, et_hhmm.split(":"))
+    et_dt = datetime.now(_ET).replace(hour=h, minute=m, second=0, microsecond=0)
+    return et_dt.astimezone(NL)
+
+
+def _et_nl_hhmm(et_hhmm: str) -> str:
+    """Today's NL wall-clock 'HH:MM' for the given ET session time.
+
+    Use this for NL bar-time string matching/filtering so the comparison tracks
+    the real DST offset instead of a hardcoded assumption.
+    """
+    return _et_today_at(et_hhmm).strftime("%H:%M")
 
 
 def _ts() -> str:
@@ -64,11 +94,10 @@ def _max_notional(account_summary: dict | None = None) -> float:
 
 
 # ── Wall clock ────────────────────────────────────────────────────────────────
-
-def _today_at(hhmm: str) -> datetime:
-    h, m = map(int, hhmm.split(":"))
-    return datetime.now(NL).replace(hour=h, minute=m, second=0, microsecond=0)
-
+# NOTE: session anchors are ET-based (_et_today_at / _et_nl_hhmm above). There is
+# deliberately no NL-string "_today_at" helper — hardcoded NL wall-clock times
+# desync from ET during the DST-mismatch weeks and caused the opening-bar-not-found
+# failures. Always express session times in ET and convert.
 
 def _wait_until(target: datetime) -> None:
     while True:
@@ -80,22 +109,38 @@ def _wait_until(target: datetime) -> None:
 
 # ── Watchlist / state I/O ─────────────────────────────────────────────────────
 
-def _load_watchlist(wait_minutes: int = 30) -> list[dict]:
+def _load_watchlist(wait_minutes: int = 30, alert_after_minutes: float = 3.0) -> list[dict]:
     """Load today's watchlist_YYYYMMDD.json from WATCHLIST_DIR.
 
     If the file doesn't exist yet (screener still running), waits up to
-    wait_minutes before raising FileNotFoundError.
+    wait_minutes before raising FileNotFoundError. Sends a one-time Telegram
+    alert once the wait exceeds alert_after_minutes so the operator learns
+    early that the screener may have failed — instead of only finding out when
+    the live engine crashes at the deadline.
     """
     today = datetime.now(NL).strftime("%Y%m%d")
     path  = Path(config.WATCHLIST_DIR) / f"watchlist_{today}.json"
-    deadline = time.time() + wait_minutes * 60
+    started  = time.time()
+    deadline = started + wait_minutes * 60
+    alerted  = False
     while not path.exists():
         remaining = deadline - time.time()
         if remaining <= 0:
+            send_message(
+                f"🔴 <b>Live Engine</b>: watchlist for {today} never appeared "
+                f"after {wait_minutes}m. Did the 14:30 screener run? Trading skipped."
+            )
             raise FileNotFoundError(
                 f"Watchlist not found after waiting {wait_minutes}m: {path}\n"
                 f"Run the Phase 1 screener first."
             )
+        if not alerted and (time.time() - started) >= alert_after_minutes * 60:
+            send_message(
+                f"⚠️ <b>Live Engine</b>: watchlist for {today} still not ready "
+                f"after {alert_after_minutes:.0f}m — waiting up to "
+                f"{remaining/60:.0f}m more. Check the screener."
+            )
+            alerted = True
         wait = min(30, remaining)
         print(f"  [watchlist] File not ready yet — retrying in {wait:.0f}s "
               f"({remaining/60:.1f}m left)...")

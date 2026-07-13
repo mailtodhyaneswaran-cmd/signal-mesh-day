@@ -49,18 +49,15 @@ import ibkr_connector
 from profiles import get_profile
 from session_runtime import (
     _SIGNAL_TO_DIRECTION,
-    _risk_usd, _max_notional, _today_at, _wait_until,
+    _risk_usd, _max_notional, _wait_until,
+    _et_today_at, _et_nl_hhmm,
+    ET_OPEN, ET_VWAP_WINDOW_END, ET_SESSION_END,
     _save_state, _force_fill, _monitor_bracket,
 )
 from strategy_orb import Bar, OpeningRange, ORBConfig, position_size_usd
 from telegram_notify import send_message
 
 NL = ZoneInfo("Europe/Amsterdam")
-
-# VWAP timings (NL / Amsterdam time)
-US_OPEN            = "15:30"
-US_VWAP_WINDOW_END = "20:00"   # 14:00 ET — stop VWAP reversion
-US_SESSION_END     = "22:00"   # hard EOD flatten
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -179,12 +176,19 @@ def run(
     state_lock:      threading.Lock,
     profile:         dict | None = None,
     account_summary: dict | None = None,
-) -> None:
+    *,
+    window_end_override=None,
+    allow_force_fill: bool = True,
+    stagger_index:    int = 0,
+) -> bool:
     """Run the full VWAP reversion session for one watchlist pick (own thread).
 
     Polls 1-min bars from open, computes running VWAP, and enters when
     price deviates >= vwap_min_deviation% away with a reversal confirmation.
     Called by bin/live_engine.py.
+
+    window_end_override / allow_force_fill: see strategy_orb.run().
+    Returns True if a trade was placed (real or forced), else False.
     """
     if profile is None:
         profile = get_profile(config.PROFILE)
@@ -193,23 +197,24 @@ def run(
     signal      = pick.get("signal", "HOLD")
     direction   = _SIGNAL_TO_DIRECTION.get(signal, "skip")
     currency    = pick.get("currency", "USD")
-    session_end = _today_at(US_SESSION_END)
-    window_end  = _today_at(US_VWAP_WINDOW_END)
+    session_end = _et_today_at(ET_SESSION_END)
+    window_end  = window_end_override or _et_today_at(ET_VWAP_WINDOW_END)
+    open_nl     = _et_nl_hhmm(ET_OPEN)   # 09:30 ET in NL
 
     if direction == "skip":
         send_message(f"😴 {ticker} — HOLD signal, skipping VWAP today.")
-        return
+        return False
 
     with state_lock:
         if state["trades"].get(ticker):
-            return
+            return False
 
     cfg_vwap      = VWAPConfig.from_params(config.INTRADAY_PARAMS)
     polls_per_sec = config.INTRADAY_PARAMS.poll_interval_sec
     contract      = ibkr_connector.get_contract(ticker, "SMART", currency)
 
     # Fetch all bars since open to seed the VWAP history
-    _wait_until(_today_at(US_OPEN))
+    _wait_until(_et_today_at(ET_OPEN))
     seed_raw = ibkr_connector.get_historical_bars(
         ib, contract, "3600 S", "1 min", use_rth=True,
     )
@@ -219,7 +224,7 @@ def run(
             open=b.open, high=b.high, low=b.low, close=b.close, volume=float(b.volume),
         )
         for b in (seed_raw or [])
-        if b.date.astimezone(NL).strftime("%H:%M") >= US_OPEN
+        if b.date.astimezone(NL).strftime("%H:%M") >= open_nl
     ]
 
     send_message(
@@ -309,9 +314,9 @@ def run(
         bracket   = {"entry": entry_f, "take_profit": tp, "stop": stop, "qty": qty}
         _monitor_bracket(ib, contract, trades, setup_dir,
                          bracket, fake_orng, ticker, currency, session_end)
-        return
+        return True
 
-    if profile.get("force_trade"):
+    if profile.get("force_trade") and allow_force_fill:
         # Use the last known VWAP level (or mid of bar_history) for the synthetic range
         last_bars  = bar_history[-5:] if len(bar_history) >= 5 else bar_history
         fake_high  = max(b.high for b in last_bars) if last_bars else 0
@@ -320,8 +325,9 @@ def run(
         cfg_orb    = ORBConfig.from_params(config.INTRADAY_PARAMS)
         _force_fill(ticker, ib, contract, fake_orng, direction if direction != "skip" else "long",
                     cfg_orb, profile, account_summary, state, state_lock, session_end, currency)
-    else:
-        send_message(f"😴 {ticker} VWAP — no setup by {US_VWAP_WINDOW_END} NL.")
+        return True
+    send_message(f"😴 {ticker} VWAP — no setup by {window_end.strftime('%H:%M')} NL.")
+    return False
 
 
 # ── Backtest simulation ────────────────────────────────────────────────────────
@@ -424,9 +430,12 @@ def _manage_vwap_trade(
 ) -> VWAPTradeResult:
     exit_price, reason = entry, "session_end"
 
-    for bar in bars[start:]:
-        # Update running VWAP (only bars up to and including current)
-        running_vwap = compute_vwap(bars[:bars.index(bar) + 1])
+    for idx in range(start, len(bars)):
+        bar = bars[idx]
+        # Update running VWAP (only bars up to and including current).
+        # Index by position (not bars.index(bar), which is O(n) per bar and
+        # returns the wrong index if two bars compare equal).
+        running_vwap = compute_vwap(bars[:idx + 1])
 
         if direction == "long":
             hit_sl   = bar.low  <= stop

@@ -5,6 +5,8 @@ Scores four market signals at premarket (~9:00 ET) to pick the best
 strategy for the day.  Highest score wins; on a tie the preference
 order is VWAP > IB > ORB (VWAP is most robust to data gaps).
 
+Tie-break order is VWAP > ORB > IB (see RegimeScore.winner).
+
 Public API
 ──────────
   pick_strategy(mkt_ctx, candidates, params) -> (str, RegimeScore)
@@ -13,8 +15,10 @@ Public API
   next_strategy(current: str) -> str
       Runtime fallback: ORB → IB → VWAP → SIT_OUT
 
-  FALLBACK_WINDOW_NL: dict mapping strategy → NL time cutoff
-      After this time, if strategy hasn't triggered, call next_strategy().
+  FALLBACK_WINDOW_ET: dict mapping strategy → ET give-up time
+      After this ET time, if the strategy hasn't triggered, cascade to
+      next_strategy(). Stored in ET and converted to NL at runtime
+      (session_runtime._et_today_at) so it is DST-correct year-round.
 
 Scoring table (from todo_master.md):
 
@@ -45,7 +49,7 @@ class RegimeScore:
     vwap: int = 0
 
     def winner(self) -> str:
-        """Return the highest-scoring strategy.  Tie-break: VWAP > ORB > IB.
+        """Return the highest-scoring strategy.  Tie-break order: VWAP > ORB > IB.
 
         ORB is preferred over IB on a tie because:
         - ORB fires at 09:30 ET and needs only the 5-min opening bar (highly
@@ -137,14 +141,15 @@ def pick_strategy(
 
 _FALLBACK_CHAIN = {"ORB": "IB", "IB": "VWAP", "VWAP": "SIT_OUT"}
 
-# NL times: if chosen strategy hasn't triggered by this time, cascade down.
-#   ORB  no trigger by 16:00 NL (10:00 ET) → try IB
-#   IB   no trigger by 17:00 NL (11:00 ET) → try VWAP
-#   VWAP no edge by   20:00 NL (14:00 ET)  → sit out
-FALLBACK_WINDOW_NL: dict[str, str] = {
-    "ORB":  "16:00",
-    "IB":   "17:00",
-    "VWAP": "20:00",
+# ET give-up times: if the chosen strategy hasn't triggered by this ET time,
+# cascade down the chain. Converted to NL at runtime so DST never desyncs them.
+#   ORB  no trigger by 10:00 ET → try IB   (IB range closes 10:30 ET)
+#   IB   no trigger by 11:00 ET → try VWAP
+#   VWAP no edge by   14:00 ET  → sit out
+FALLBACK_WINDOW_ET: dict[str, str] = {
+    "ORB":  "10:00",
+    "IB":   "11:00",
+    "VWAP": "14:00",
 }
 
 

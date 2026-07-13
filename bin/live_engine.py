@@ -38,8 +38,10 @@ import strategy_ib
 import strategy_orb
 import strategy_vwap
 from profiles import get_profile
+from regime import next_strategy, FALLBACK_WINDOW_ET
 from session_runtime import (
-    _SIGNAL_TO_DIRECTION, _eod_safety_flatten, _load_state, _load_watchlist, _ts,
+    _SIGNAL_TO_DIRECTION, _eod_safety_flatten, _et_today_at, _load_state,
+    _load_watchlist, _ts,
 )
 from telegram_notify import send_message
 
@@ -50,6 +52,83 @@ _DISPATCH = {
     "IB":   strategy_ib.run,
     "VWAP": strategy_vwap.run,
 }
+
+
+def _strategy_chain(first: str) -> list[str]:
+    """Build the fallback chain for one pick: first -> next -> ... (excl SIT_OUT)."""
+    chain, s = [], first
+    while s in _DISPATCH:
+        chain.append(s)
+        s = next_strategy(s)
+    return chain
+
+
+def run_with_fallback(
+    pick:            dict,
+    ib,
+    state:           dict,
+    state_lock:      threading.Lock,
+    first_strategy:  str,
+    profile:         dict,
+    account_summary: dict | None,
+    stagger_index:   int = 0,
+) -> None:
+    """Try each strategy in the fallback chain until one places a trade.
+
+    Each non-final strategy is capped at its FALLBACK_WINDOW_ET give-up time
+    (so ORB gives up at 10:00 ET and IB can take over at 10:30 ET) and is NOT
+    allowed to force-fill — force-fill is reserved for the final strategy so a
+    force_trade profile still trades exactly once at the end of the chain.
+    Runs inside the pick's own thread, mirroring the single-strategy dispatch.
+    """
+    chain = _strategy_chain(first_strategy)
+    for i, strat in enumerate(chain):
+        is_last  = (i == len(chain) - 1)
+        runner   = _DISPATCH[strat]
+        deadline = None if is_last else _et_today_at(FALLBACK_WINDOW_ET[strat])
+        print(f"  [{_ts()}] [{pick['ticker']}] fallback -> {strat} "
+              f"(deadline {'natural' if is_last else deadline.strftime('%H:%M')} NL)")
+        traded = runner(
+            pick, ib, state, state_lock,
+            profile=profile, account_summary=account_summary,
+            window_end_override=deadline, allow_force_fill=is_last,
+            stagger_index=stagger_index,
+        )
+        if traded:
+            return
+
+
+def _startup_reconcile(ib, actionable: list) -> None:
+    """Clean up state left by a prior crash before placing new orders.
+
+    Cancels any open orders for today's watchlist symbols (stale brackets from a
+    process that died mid-session) and reports any open positions so the operator
+    is aware. Positions are NOT auto-flattened here — the EOD safety net handles
+    end-of-day; this only prevents duplicate/stale bracket legs colliding.
+    """
+    watchlist = {p["ticker"] for p in actionable}
+    try:
+        ib.sleep(1)
+        open_trades = ib.openTrades()
+        cancelled = 0
+        for tr in open_trades:
+            if tr.contract.symbol in watchlist and tr.orderStatus.status not in ("Filled", "Cancelled"):
+                ibkr_connector.cancel_order(ib, tr)
+                cancelled += 1
+        positions = [p for p in ib.positions()
+                     if p.contract.symbol in watchlist and p.position != 0]
+        if cancelled or positions:
+            lines = [f"⚠️ <b>Startup reconcile</b>: cancelled {cancelled} stale order(s)."]
+            for p in positions:
+                lines.append(f"  open position {p.contract.symbol}: {int(p.position)} sh "
+                             f"(will be flattened at EOD)")
+            msg = "\n".join(lines)
+            print("  " + msg.replace("<b>", "").replace("</b>", ""))
+            send_message(msg)
+        else:
+            print("  Startup reconcile: no stale orders or open positions.")
+    except Exception as e:
+        print(f"[startup reconcile] {e}")
 
 
 def main() -> None:
@@ -120,26 +199,43 @@ def main() -> None:
         msg = f"⚠️ Cannot read account summary: {e}. Sizing falls back to config.HOUSE_MONEY_EUR."
         print(msg); send_message(msg)
 
+    # Startup reconciliation: cancel any stray open orders and report any open
+    # positions left by a prior crash before we start placing new brackets.
+    _startup_reconcile(ib, actionable)
+
     state      = _load_state()
     state_lock = threading.Lock()
     max_picks  = profile.get("max_picks", config.MAX_CONCURRENT_POSITIONS)
+
+    # When the profile enables the waterfall, each pick tries the whole
+    # ORB -> IB -> VWAP chain (capped at each strategy's give-up time) instead
+    # of only the single regime-chosen strategy.
+    use_waterfall = bool(profile.get("use_fallback_waterfall")) and strategy in _DISPATCH
 
     threads: list[threading.Thread] = []
     for i, pick in enumerate(actionable[:max_picks]):
         # IB's fetch is a single bulk 60-min-range request per ticker, so it
         # staggers to avoid IBKR pacing throttle; the others poll one bar at
-        # a time and don't need it.
-        extra = {"stagger_index": i} if strategy == "IB" else {}
+        # a time and ignore stagger_index.
+        if use_waterfall:
+            target = run_with_fallback
+            args   = (pick, ib, state, state_lock, strategy)
+            kwargs = {"profile": profile, "account_summary": account_summary,
+                      "stagger_index": i}
+        else:
+            target = runner
+            args   = (pick, ib, state, state_lock)
+            kwargs = {"profile": profile, "account_summary": account_summary,
+                      "stagger_index": i}
         t = threading.Thread(
-            target=runner,
-            args=(pick, ib, state, state_lock),
-            kwargs={"profile": profile, "account_summary": account_summary, **extra},
+            target=target, args=args, kwargs=kwargs,
             name=f"{strategy}-{pick['ticker']}",
             daemon=True,
         )
         t.start()
         threads.append(t)
-        print(f"  [{_ts()}] [{pick['ticker']}] {strategy} thread started")
+        print(f"  [{_ts()}] [{pick['ticker']}] {strategy} thread started"
+              f"{' (waterfall)' if use_waterfall else ''}")
 
     for t in threads:
         t.join()

@@ -34,7 +34,9 @@ import ibkr_connector
 from profiles import get_profile
 from session_runtime import (
     _SIGNAL_TO_DIRECTION,
-    _risk_usd, _max_notional, _today_at, _wait_until,
+    _risk_usd, _max_notional, _wait_until,
+    _et_today_at, _et_nl_hhmm,
+    ET_OPEN, ET_IB_RANGE_END, ET_IB_WINDOW_END, ET_SESSION_END,
     _save_state, _force_fill, _monitor_bracket,
 )
 from strategy_orb import (
@@ -46,12 +48,6 @@ from telegram_notify import send_message
 NL = ZoneInfo("Europe/Amsterdam")
 
 IB_DEFAULT_RANGE_MINUTES = 60
-
-# IB timings (NL / Amsterdam time)
-US_OPEN           = "15:30"
-US_IB_RANGE_END   = "16:30"   # 10:30 ET — 60-min IB range closes
-US_IB_WINDOW_END  = "17:00"   # 11:00 ET — stop looking for IB breakout
-US_SESSION_END    = "22:00"   # hard EOD flatten
 
 
 def _ib_config(params) -> ORBConfig:
@@ -72,39 +68,47 @@ def run(
     state_lock:      threading.Lock,
     profile:         dict | None = None,
     account_summary: dict | None = None,
+    *,
+    window_end_override=None,
+    allow_force_fill: bool = True,
     stagger_index:   int = 0,
-) -> None:
+) -> bool:
     """Run the full 60-min IB session for one watchlist pick (own thread).
 
     Waits for the first 60 minutes of trading to close (10:30 ET), captures
     the IB range, then watches for a breakout + retest using strategy_orb's
     primitives — just with a wider range. Called by bin/live_engine.py.
+
+    window_end_override / allow_force_fill: see strategy_orb.run().
+    Returns True if a trade was placed (real or forced), else False.
     """
     if profile is None:
         profile = get_profile(config.PROFILE)
 
-    ticker      = pick["ticker"]
-    signal      = pick.get("signal", "HOLD")
-    direction   = _SIGNAL_TO_DIRECTION.get(signal, "skip")
-    currency    = pick.get("currency", "USD")
-    session_end = _today_at(US_SESSION_END)
-    window_end  = _today_at(US_IB_WINDOW_END)
+    ticker        = pick["ticker"]
+    signal        = pick.get("signal", "HOLD")
+    direction     = _SIGNAL_TO_DIRECTION.get(signal, "skip")
+    currency      = pick.get("currency", "USD")
+    session_end   = _et_today_at(ET_SESSION_END)
+    window_end    = window_end_override or _et_today_at(ET_IB_WINDOW_END)
+    open_nl       = _et_nl_hhmm(ET_OPEN)             # 09:30 ET in NL
+    ib_range_nl   = _et_nl_hhmm(ET_IB_RANGE_END)     # 10:30 ET in NL
 
     if direction == "skip":
         send_message(f"😴 {ticker} — HOLD signal, skipping IB today.")
-        return
+        return False
 
     with state_lock:
         if state["trades"].get(ticker):
-            return
+            return False
 
     send_message(
         f"🔔 IB watching <b>{ticker}</b>  ·  bias: {direction.upper()}\n"
-        f"  Waiting for 60-min IB range to close at {US_IB_RANGE_END} NL..."
+        f"  Waiting for 60-min IB range to close at {ib_range_nl} NL..."
     )
 
     # ── Wait for 60-min IB range to close ────────────────────────────────
-    _wait_until(_today_at(US_IB_RANGE_END))
+    _wait_until(_et_today_at(ET_IB_RANGE_END))
 
     # Give IBKR 90s to finalize the 10:30 ET bar before any request.
     time.sleep(90)
@@ -125,7 +129,7 @@ def run(
                f"Contract: {contract}. Check TWS market data subscriptions.")
         print(msg); send_message(msg)
         # try_luck: bars unavailable → synthetic force-fill rather than giving up
-        if profile.get("force_trade") and not state["trades"].get(ticker):
+        if profile.get("force_trade") and allow_force_fill and not state["trades"].get(ticker):
             last_bar = ibkr_connector.get_latest_closed_1min_bar(ib, contract)
             if last_bar:
                 p = last_bar.close
@@ -136,21 +140,22 @@ def run(
                 _force_fill(ticker, ib, contract, synth_orng, direction,
                             _ib_config(config.INTRADAY_PARAMS),
                             profile, account_summary, state, state_lock, session_end, currency)
-        return
+                return True
+        return False
 
-    # Filter to bars from 15:30–16:30 NL (09:30–10:30 ET)
+    # Filter to bars from 09:30–10:30 ET (converted to NL for the bar timestamps)
     ib_bars = [
         Bar(
             t=b.date.astimezone(NL).strftime("%H:%M"),
             open=b.open, high=b.high, low=b.low, close=b.close, volume=float(b.volume),
         )
         for b in ib_bars_raw
-        if US_OPEN <= b.date.astimezone(NL).strftime("%H:%M") < US_IB_RANGE_END
+        if open_nl <= b.date.astimezone(NL).strftime("%H:%M") < ib_range_nl
     ]
     if len(ib_bars) < 10:
         msg = f"⚠️ {ticker}: only {len(ib_bars)} IB bars — skipping."
         print(msg); send_message(msg)
-        return
+        return False
 
     # Build ORBConfig tuned for IB (60-min range, RVOL disabled)
     cfg = _ib_config(config.INTRADAY_PARAMS)
@@ -166,10 +171,11 @@ def run(
 
     orng = capture_opening_range(ib_bars, cfg, ticker)
     if orng is None:
-        msg = f"😴 {ticker} IB range too thin — {'forcing entry' if profile.get('force_trade') else 'skipping'}"
+        will_force = profile.get("force_trade") and allow_force_fill
+        msg = f"😴 {ticker} IB range too thin — {'forcing entry' if will_force else 'skipping'}"
         print(msg); send_message(msg)
-        if not profile.get("force_trade"):
-            return
+        if not will_force:
+            return False
         orng = OpeningRange(ticker=ticker,
                             high=max(b.high for b in ib_bars),
                             low=min(b.low  for b in ib_bars))
@@ -205,7 +211,7 @@ def run(
                                             _risk_usd(account_summary), _max_notional(account_summary))
                     if bracket["qty"] == 0:
                         send_message(f"⚠️ {ticker} IB qty=0 — skipping.")
-                        return
+                        return False
                     action = "BUY" if direction_confirmed == "long" else "SELL"
                     trades = ibkr_connector.place_bracket_order(
                         ib, contract, action, bracket["qty"],
@@ -221,7 +227,7 @@ def run(
                         _save_state(state)
                     _monitor_bracket(ib, contract, trades, direction_confirmed,
                                      bracket, orng, ticker, currency, session_end)
-                    return
+                    return True
 
                 send_message(
                     f"{'📈' if direction=='long' else '📉'} <b>{ticker}</b> IB "
@@ -233,7 +239,7 @@ def run(
             if retest is False:
                 if cfg.require_retest:
                     send_message(f"⚠️ {ticker} IB failed retest — skipping today.")
-                    return
+                    return False
                 direction_confirmed = None
             elif retest is True:
                 entry_price = orng.high if direction_confirmed == "long" else orng.low
@@ -241,7 +247,7 @@ def run(
                                             _risk_usd(account_summary), _max_notional(account_summary))
                 if bracket["qty"] == 0:
                     send_message(f"⚠️ {ticker} IB qty=0 (stop too wide) — skipping.")
-                    return
+                    return False
                 action = "BUY" if direction_confirmed == "long" else "SELL"
                 trades = ibkr_connector.place_bracket_order(
                     ib, contract, action, bracket["qty"],
@@ -257,15 +263,16 @@ def run(
                     _save_state(state)
                 _monitor_bracket(ib, contract, trades, direction_confirmed,
                                  bracket, orng, ticker, currency, session_end)
-                return
+                return True
 
         time.sleep(polls_per_sec)
 
-    if profile.get("force_trade"):
+    if profile.get("force_trade") and allow_force_fill:
         _force_fill(ticker, ib, contract, orng, direction, cfg, profile,
                     account_summary, state, state_lock, session_end, currency)
-    else:
-        send_message(f"😴 {ticker} IB — no clean setup by {US_IB_WINDOW_END} NL, standing aside.")
+        return True
+    send_message(f"😴 {ticker} IB — no clean setup by {window_end.strftime('%H:%M')} NL, standing aside.")
+    return False
 
 
 # ── Backtest simulation ────────────────────────────────────────────────────────

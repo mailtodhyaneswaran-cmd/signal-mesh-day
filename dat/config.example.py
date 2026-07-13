@@ -17,7 +17,9 @@ PROFILE = "strict_officer"
 IBKR_HOST      = "127.0.0.1"
 LIVE_TRADING   = False
 IBKR_PORT      = 7496 if LIVE_TRADING else 7497   # TWS: 7497 paper / 7496 live
-IBKR_CLIENT_ID = 36                                # keep different from candle-scalping-bot (35)
+IBKR_CLIENT_ID           = 36    # live engine — keep different from candle-scalping-bot (35)
+IBKR_CLIENT_ID_SCREENER  = 37    # premarket screener — distinct so an overrunning
+                                 # screener can't lock the live engine out of TWS
 
 # ibkr_connector.get_historical_bars() retry policy — shared by every strategy.
 IBKR_HIST_RETRIES         = 10   # attempts before giving up on an empty result

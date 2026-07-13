@@ -41,10 +41,42 @@ from setup_paths import RVOL_CACHE_DIR as _RVOL_CACHE_DIR
 _HIST_LOCK = _threading.Lock()
 
 
-def connect() -> IB:
-    ib = IB()
-    ib.connect(config.IBKR_HOST, config.IBKR_PORT, clientId=config.IBKR_CLIENT_ID)
+def connect(client_id: int | None = None) -> IB:
+    """Connect to IBKR TWS/Gateway.
+
+    client_id defaults to config.IBKR_CLIENT_ID (the live engine). The premarket
+    screener passes config.IBKR_CLIENT_ID_SCREENER so an overrunning screener and
+    the live engine never collide on the same client id (which IBKR rejects).
+    """
+    cid = config.IBKR_CLIENT_ID if client_id is None else client_id
+    ib  = IB()
+    ib.connect(config.IBKR_HOST, config.IBKR_PORT, clientId=cid)
     return ib
+
+
+def ensure_connected(ib: IB, client_id: int | None = None, attempts: int = 3) -> bool:
+    """Reconnect a dropped IBKR session in place.
+
+    A mid-session network blip or TWS restart leaves ib disconnected and every
+    subsequent poll/order throws. Callers guard their IBKR calls with this so a
+    blip degrades to a short pause instead of killing the trading day.
+
+    Returns True if connected (already or after reconnect), False if all
+    attempts failed.
+    """
+    if ib.isConnected():
+        return True
+    cid = config.IBKR_CLIENT_ID if client_id is None else client_id
+    for attempt in range(attempts):
+        try:
+            ib.connect(config.IBKR_HOST, config.IBKR_PORT, clientId=cid)
+            if ib.isConnected():
+                print(f"[ibkr_connector] reconnected (attempt {attempt+1}/{attempts})")
+                return True
+        except Exception as e:
+            print(f"[ibkr_connector] reconnect attempt {attempt+1}/{attempts} failed: {e}")
+        _time.sleep(2 ** attempt)
+    return False
 
 
 def get_account_summary(ib: IB, retries: int = 5, delay: float = 1.5) -> dict:
@@ -136,6 +168,10 @@ def get_historical_bars(
     retries     = config.IBKR_HIST_RETRIES      if retries     is None else retries
     retry_delay = config.IBKR_HIST_RETRY_DELAY_SEC if retry_delay is None else retry_delay
 
+    if not ensure_connected(ib):
+        print(f"[ibkr_connector] get_historical_bars({contract.symbol}): not connected")
+        return []
+
     if not contract.conId:
         try:
             ib.qualifyContracts(contract)
@@ -161,9 +197,17 @@ def get_historical_bars(
     return []
 
 
+# Fast-poll helpers below use retries=1: inside a 60s poll loop an empty result
+# just means "no new bar yet", so we must return immediately instead of blocking
+# the thread for the bulk-fetch default (IBKR_HIST_RETRIES × IBKR_HIST_RETRY_DELAY_SEC).
+# Only the IB 60-min range bulk fetch (strategy_ib) wants the aggressive retry.
+_POLL_RETRIES = 1
+
+
 def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str):
     """Return the 5-min bar that starts at opening_time (NL local HH:MM), or None."""
-    bars = get_historical_bars(ib, contract, "3600 S", "5 mins", use_rth=True)
+    bars = get_historical_bars(ib, contract, "3600 S", "5 mins", use_rth=True,
+                               retries=_POLL_RETRIES)
     for bar in bars:
         if bar.date.astimezone(NL).strftime("%H:%M") == opening_time:
             return bar
@@ -172,7 +216,8 @@ def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str):
 
 def get_latest_closed_1min_bar(ib: IB, contract: Stock):
     """Return the most recently fully closed 1-min bar."""
-    bars = get_historical_bars(ib, contract, "1800 S", "1 min", use_rth=True)
+    bars = get_historical_bars(ib, contract, "1800 S", "1 min", use_rth=True,
+                               retries=_POLL_RETRIES)
     if len(bars) < 2:
         return None
     return bars[-2]
@@ -186,7 +231,8 @@ def get_rvol(ib: IB, contract: Stock, current_volume: float) -> float:
     get_premarket_volume_ibkr() and get_avg_premarket_volume_ibkr().
     Returns 1.0 on failure (neutral — passes the gate but logs clearly).
     """
-    bars = get_historical_bars(ib, contract, "1800 S", "1 min", use_rth=True)
+    bars = get_historical_bars(ib, contract, "1800 S", "1 min", use_rth=True,
+                               retries=_POLL_RETRIES)
     recent_vols = [b.volume for b in bars[-11:-1] if b.volume > 0]
     if not recent_vols:
         return 1.0

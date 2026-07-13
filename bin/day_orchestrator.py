@@ -58,7 +58,8 @@ from day_trading_prompts import (
 )
 from sp500_universe import get_sp500_tickers
 from premarket_data import fetch_market_context, batch_gap_scan, enrich_ticker
-from regime import pick_strategy, FALLBACK_WINDOW_NL
+from regime import pick_strategy, FALLBACK_WINDOW_ET
+from session_runtime import _et_nl_hhmm
 from lib_agents_claude import ClaudeAgent
 from lib_agents_mistral import MistralAgent
 
@@ -313,7 +314,7 @@ def _write_watchlist(picks: list[dict], eurusd: float, strategy: str = "ORB") ->
         "date":             datetime.now(NL).strftime("%Y-%m-%d"),
         "generated_at_utc": now_utc,
         "strategy":         strategy,       # "ORB" | "IB" | "VWAP" | "SIT_OUT"
-        "fallback_window":  FALLBACK_WINDOW_NL.get(strategy, ""),
+        "fallback_window":  _et_nl_hhmm(FALLBACK_WINDOW_ET[strategy]) if strategy in FALLBACK_WINDOW_ET else "",
         "eur_usd_rate":     eurusd,
         "house_money_eur":  config.HOUSE_MONEY_EUR,
         "usd_budget":       usd_budget,
@@ -452,7 +453,9 @@ def run(
     # ── IBKR connection for real premarket RVOL ────────────────────────────
     ib_screener = None
     try:
-        ib_screener = ibkr_connector.connect()
+        ib_screener = ibkr_connector.connect(
+            client_id=getattr(config, "IBKR_CLIENT_ID_SCREENER", None)
+        )
         print("  IBKR connected for real premarket RVOL\n")
     except Exception as e:
         print(f"  IBKR unavailable ({e}) — RVOL will use yfinance estimate\n")
@@ -612,14 +615,15 @@ def run(
         strategy_name = "VWAP"
         print(f"  ⚠️  Regime says SIT_OUT but profile={config.PROFILE} forces VWAP")
 
+    _fallback_nl = _et_nl_hhmm(FALLBACK_WINDOW_ET[strategy_name]) if strategy_name in FALLBACK_WINDOW_ET else "n/a"
     print(f"  Strategy for today: {strategy_name}"
-          f"  (fallback window: {FALLBACK_WINDOW_NL.get(strategy_name, 'n/a')} NL)")
+          f"  (fallback window: {_fallback_nl} NL)")
     send_message(
         f"📊 <b>Regime</b>: ORB {regime_score.orb}  IB {regime_score.ib}"
         f"  VWAP {regime_score.vwap}\n"
         f"  → <b>{strategy_name}</b> today"
-        + (f"  (fallback by {FALLBACK_WINDOW_NL[strategy_name]} NL)"
-           if strategy_name in FALLBACK_WINDOW_NL else "")
+        + (f"  (fallback by {_fallback_nl} NL)"
+           if strategy_name in FALLBACK_WINDOW_ET else "")
     )
 
     # Gate 5 — max_picks from profile

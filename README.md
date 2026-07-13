@@ -81,12 +81,13 @@ signal-mesh-day/
 
 15:30 NL — Live Engine (live_engine.py)
 ─────────────────────────────────────────────────────
-  Reads watchlist (waits up to 10 min if screener still running)
+  Reads watchlist (waits, with Telegram alert if screener is late)
+  → startup reconcile (cancel stale orders, report open positions)
   → strategy field → dispatches:
 
-  ORB  (gap + RVOL days)     wait 15:35, 5-min range, breakout+retest
-  IB   (moderate-gap days)   wait 16:30, 60-min range, breakout+retest
-  VWAP (flat/choppy days)    starts 15:30, fade VWAP deviation >= 1.5%
+  ORB  (gap + RVOL days)     wait 09:35 ET, 5-min range, breakout+retest
+  IB   (moderate-gap days)   wait 10:30 ET, 60-min range, breakout+retest
+  VWAP (flat/choppy days)    starts 09:30 ET, fade VWAP deviation >= 1.5%
 
   All strategies:
     → bracket order (entry limit / SL / TP)
@@ -94,10 +95,16 @@ signal-mesh-day/
     → EOD safety flatten (any leftover positions)
     → Telegram notifications throughout
 
-  Fallback chain: ORB → IB → VWAP → SIT_OUT
-    ORB  no trigger by 16:00 NL → try IB
-    IB   no trigger by 17:00 NL → try VWAP
-    VWAP no edge by   20:00 NL → sit out
+  Session times are anchored in ET and converted to NL at runtime, so the
+  ~2–3 weeks/year when EU and US DST switch on different dates never desync
+  the bot (offset is not assumed to be a constant 6h).
+
+  Fallback waterfall (profiles with use_fallback_waterfall, e.g. snake_senthil):
+  each pick tries the chain until one strategy trades —
+    ORB  no trigger by 10:00 ET → try IB   (IB range closes 10:30 ET)
+    IB   no trigger by 11:00 ET → try VWAP
+    VWAP no edge by   14:00 ET  → sit out
+  Only the final strategy in the chain may force-fill (force_trade profiles).
 ```
 
 ---
@@ -134,7 +141,7 @@ python tst/test_connection.py --eurusd
 
 | Task | Time (NL) | Script |
 |------|-----------|--------|
-| `SignalMeshDay-Screener` | 14:55 Mon–Fri | `bin/run_screener.bat` |
+| `SignalMeshDay-Screener` | 14:30 Mon–Fri | `bin/run_screener.bat` |
 | `SignalMeshDay-ORB` | 15:30 Mon–Fri | `bin/run_us.bat` → `live_engine.py` |
 
 Logs: `run_screener.log`, `run_us.log` in project root.
@@ -244,7 +251,9 @@ Scores 4 signals to pick today's strategy:
 | RVOL 1.5–3x | +1 | +2 | 0 |
 | RVOL < 1.5x | 0 | 0 | +2 |
 
-Tiebreak preference: **VWAP > IB > ORB** (VWAP most robust to missing data).
+Tiebreak preference: **VWAP > ORB > IB** (VWAP most robust to missing data;
+ORB over IB because ORB needs only the 09:30 ET 5-min bar while IB needs a bulk
+60-min fetch that is more prone to IBKR data-load spikes).
 
 ---
 
@@ -314,3 +323,8 @@ Single source of truth for live engine and backtest.
 - [ ] Walk-forward backtest (6+ months data) for IB + VWAP edge validation
 - [ ] `live_engine.py` IB/VWAP runners tested live on paper account
 - [ ] RVOL message clarity: distinguish Sunday/closed-market from genuine data failure
+- [ ] **Move live bar polling to `reqRealTimeBars` (5s) streaming** — the recurring
+      IBKR pacing storms (Error 366 / timeouts) come from using `reqHistoricalData`
+      as a live feed. Streaming would remove the thundering herd at the source and
+      cut breakout latency from ~60s to ~5s. Deferred as its own effort (large
+      structural change to every strategy's poll loop; needs its own paper cycle).
