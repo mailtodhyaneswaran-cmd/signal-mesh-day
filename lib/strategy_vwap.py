@@ -1,8 +1,8 @@
 """
-vwap_strategy.py — VWAP Reversion engine.
+strategy_vwap.py — VWAP Reversion strategy.
 
 VWAP (Volume Weighted Average Price) is the average price of all trades
-today, weighted by volume.  It resets at 9:30 ET.  Price gravitates back
+today, weighted by volume. It resets at 9:30 ET. Price gravitates back
 to VWAP — overextensions above/below VWAP tend to mean-revert.
 
 Strategy logic
@@ -27,23 +27,47 @@ Key differences from ORB/IB
 
 VWAP formula (typical/price weighting):
   VWAP = sum((H + L + C) / 3 × V) / sum(V)
+
+All IBKR access goes through ibkr_connector.py. All engine plumbing shared
+with the other strategies lives in session_runtime.py.
+
+Called by bin/live_engine.py via run(); never run directly.
 """
 from __future__ import annotations
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 
 import statistics
-from dataclasses import dataclass, field
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Sequence
+from zoneinfo import ZoneInfo
 
-from orb_core import Bar, TradeResult, position_size_usd
-from strategy_base import StrategySignal, STRATEGY_REGISTRY
+import config
+import ibkr_connector
+from profiles import get_profile
+from session_runtime import (
+    _SIGNAL_TO_DIRECTION,
+    _risk_usd, _max_notional, _today_at, _wait_until,
+    _save_state, _force_fill, _monitor_bracket,
+)
+from strategy_orb import Bar, OpeningRange, ORBConfig, position_size_usd
+from telegram_notify import send_message
+
+NL = ZoneInfo("Europe/Amsterdam")
+
+# VWAP timings (NL / Amsterdam time)
+US_OPEN            = "15:30"
+US_VWAP_WINDOW_END = "20:00"   # 14:00 ET — stop VWAP reversion
+US_SESSION_END     = "22:00"   # hard EOD flatten
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class VWAPConfig:
-    """All tunable VWAP-reversion knobs.  Read from config.INTRADAY_PARAMS."""
+    """All tunable VWAP-reversion knobs. Read from config.INTRADAY_PARAMS."""
     min_deviation:       float = 0.015   # 1.5 % from VWAP to trigger
     tp_r_multiple:       float = 1.5     # more conservative than ORB (2R)
     require_reversal:    bool  = True     # wait for a bar closing back toward VWAP
@@ -146,56 +170,158 @@ def detect_vwap_setup(
     return direction, bar.close, vwap
 
 
-# ── Strategy Protocol implementation ─────────────────────────────────────────
+# ── Live session runner (single ticker, one thread) ──────────────────────────
 
-class VWAPStrategy:
-    """VWAP Reversion strategy.  Implements the Strategy protocol."""
-    name = "vwap"
+def run(
+    pick:            dict,
+    ib,
+    state:           dict,
+    state_lock:      threading.Lock,
+    profile:         dict | None = None,
+    account_summary: dict | None = None,
+) -> None:
+    """Run the full VWAP reversion session for one watchlist pick (own thread).
 
-    def evaluate(
-        self,
-        bars:   list[Bar],
-        bias:   str,
-        params,
-    ) -> StrategySignal:
-        """
-        Evaluate VWAP setup from accumulated intraday bars.
+    Polls 1-min bars from open, computes running VWAP, and enters when
+    price deviates >= vwap_min_deviation% away with a reversal confirmation.
+    Called by bin/live_engine.py.
+    """
+    if profile is None:
+        profile = get_profile(config.PROFILE)
 
-        Called by the live engine on every new 1-min bar.
-        Returns StrategySignal(direction="skip") if no setup is present.
-        """
-        cfg = VWAPConfig.from_params(params)
+    ticker      = pick["ticker"]
+    signal      = pick.get("signal", "HOLD")
+    direction   = _SIGNAL_TO_DIRECTION.get(signal, "skip")
+    currency    = pick.get("currency", "USD")
+    session_end = _today_at(US_SESSION_END)
+    window_end  = _today_at(US_VWAP_WINDOW_END)
 
-        direction, entry, vwap = detect_vwap_setup(bars, cfg, bias)
-        if direction is None:
-            return StrategySignal(direction="skip")
+    if direction == "skip":
+        send_message(f"😴 {ticker} — HOLD signal, skipping VWAP today.")
+        return
 
-        atr = _atr_estimate(bars[-cfg.min_atr_bars:])
-        slip = cfg.slippage_pct * entry
+    with state_lock:
+        if state["trades"].get(ticker):
+            return
 
-        if direction == "long":
-            entry_filled = entry + slip
-            stop         = entry_filled - cfg.stop_atr_mult * atr
-            risk         = entry_filled - stop
-            target       = entry_filled + cfg.tp_r_multiple * risk
-        else:
-            entry_filled = entry - slip
-            stop         = entry_filled + cfg.stop_atr_mult * atr
-            risk         = stop - entry_filled
-            target       = entry_filled - cfg.tp_r_multiple * risk
+    cfg_vwap      = VWAPConfig.from_params(config.INTRADAY_PARAMS)
+    polls_per_sec = config.INTRADAY_PARAMS.poll_interval_sec
+    contract      = ibkr_connector.get_contract(ticker, "SMART", currency)
 
-        if risk <= 0:
-            return StrategySignal(direction="skip")
+    # Fetch all bars since open to seed the VWAP history
+    _wait_until(_today_at(US_OPEN))
+    seed_raw = ibkr_connector.get_historical_bars(
+        ib, contract, "3600 S", "1 min", use_rth=True,
+    )
+    bar_history: list[Bar] = [
+        Bar(
+            t=b.date.astimezone(NL).strftime("%H:%M"),
+            open=b.open, high=b.high, low=b.low, close=b.close, volume=float(b.volume),
+        )
+        for b in (seed_raw or [])
+        if b.date.astimezone(NL).strftime("%H:%M") >= US_OPEN
+    ]
 
-        return StrategySignal(
-            direction = direction,
-            entry     = round(entry_filled, 4),
-            stop      = round(stop, 4),
-            target    = round(target, 4),
+    send_message(
+        f"📡 VWAP watching <b>{ticker}</b>  ·  "
+        f"deviation gate {cfg_vwap.min_deviation*100:.1f}%  "
+        f"bias: {'auto' if direction=='skip' else direction.upper()}"
+    )
+
+    # ── Poll loop ─────────────────────────────────────────────────────────
+    seen_last_t: str | None = bar_history[-1].t if bar_history else None
+
+    while datetime.now(NL) < window_end:
+        bar_raw = ibkr_connector.get_latest_closed_1min_bar(ib, contract)
+        if bar_raw is None:
+            time.sleep(polls_per_sec)
+            continue
+
+        bar_t = bar_raw.date.astimezone(NL).strftime("%H:%M")
+        if bar_t == seen_last_t:
+            time.sleep(polls_per_sec)
+            continue
+        seen_last_t = bar_t
+
+        bar = Bar(
+            t=bar_t, open=bar_raw.open, high=bar_raw.high,
+            low=bar_raw.low, close=bar_raw.close, volume=float(bar_raw.volume),
+        )
+        bar_history.append(bar)
+
+        if len(bar_history) < cfg_vwap.warmup_bars + 1:
+            time.sleep(polls_per_sec)
+            continue
+
+        # bias: "auto" = fade whichever side is overextended
+        # "long"/"short" = only fade price that moved against the signal direction
+        vwap_bias = "auto" if direction == "skip" else direction
+        setup_dir, entry_price, vwap_level = detect_vwap_setup(
+            bar_history, cfg_vwap, bias=vwap_bias
         )
 
+        if setup_dir is None:
+            time.sleep(polls_per_sec)
+            continue
 
-STRATEGY_REGISTRY["vwap"] = VWAPStrategy
+        # Build bracket levels from the setup
+        atr_bars = bar_history[-cfg_vwap.min_atr_bars:]
+        atr_est  = _atr_estimate(atr_bars)
+        slip     = cfg_vwap.slippage_pct * entry_price
+
+        if setup_dir == "long":
+            entry_f  = entry_price + slip
+            stop     = round(entry_f - cfg_vwap.stop_atr_mult * atr_est, 2)
+            risk     = entry_f - stop
+            tp       = round(entry_f + cfg_vwap.tp_r_multiple * risk, 2)
+        else:
+            entry_f  = entry_price - slip
+            stop     = round(entry_f + cfg_vwap.stop_atr_mult * atr_est, 2)
+            risk     = stop - entry_f
+            tp       = round(entry_f - cfg_vwap.tp_r_multiple * risk, 2)
+
+        entry_f  = round(entry_f, 2)
+        if risk <= 0:
+            time.sleep(polls_per_sec)
+            continue
+
+        qty = position_size_usd(_risk_usd(account_summary), risk,
+                                _max_notional(account_summary), entry_f)
+        if qty == 0:
+            send_message(f"⚠️ {ticker} VWAP qty=0 (stop too wide) — skipping.")
+            time.sleep(polls_per_sec)
+            continue
+
+        action = "BUY" if setup_dir == "long" else "SELL"
+        trades = ibkr_connector.place_bracket_order(
+            ib, contract, action, qty, entry_f, tp, stop
+        )
+        send_message(
+            f"✅ VWAP {'Long' if setup_dir=='long' else 'Short'} <b>{ticker}</b>  "
+            f"entry {entry_f:.2f}  SL {stop:.2f}  TP {tp:.2f}  "
+            f"qty {qty}  VWAP={vwap_level:.2f}"
+        )
+        with state_lock:
+            state["trades"][ticker] = True
+            _save_state(state)
+
+        fake_orng = OpeningRange(ticker=ticker, high=vwap_level, low=vwap_level - risk)
+        bracket   = {"entry": entry_f, "take_profit": tp, "stop": stop, "qty": qty}
+        _monitor_bracket(ib, contract, trades, setup_dir,
+                         bracket, fake_orng, ticker, currency, session_end)
+        return
+
+    if profile.get("force_trade"):
+        # Use the last known VWAP level (or mid of bar_history) for the synthetic range
+        last_bars  = bar_history[-5:] if len(bar_history) >= 5 else bar_history
+        fake_high  = max(b.high for b in last_bars) if last_bars else 0
+        fake_low   = min(b.low  for b in last_bars) if last_bars else 0
+        fake_orng  = OpeningRange(ticker=ticker, high=fake_high, low=fake_low)
+        cfg_orb    = ORBConfig.from_params(config.INTRADAY_PARAMS)
+        _force_fill(ticker, ib, contract, fake_orng, direction if direction != "skip" else "long",
+                    cfg_orb, profile, account_summary, state, state_lock, session_end, currency)
+    else:
+        send_message(f"😴 {ticker} VWAP — no setup by {US_VWAP_WINDOW_END} NL.")
 
 
 # ── Backtest simulation ────────────────────────────────────────────────────────

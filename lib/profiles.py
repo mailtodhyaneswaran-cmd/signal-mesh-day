@@ -105,8 +105,7 @@ _PROFILES: dict[str, dict] = {
 def get_profile(name: str) -> dict:
     """Return the profile dict for *name*.
 
-    Raises KeyError on an unknown name — same pattern as STRATEGY_REGISTRY in
-    strategy_base.py so the error is loud and caught at startup.
+    Raises KeyError on an unknown name so the error is loud and caught at startup.
     """
     if name not in _PROFILES:
         available = list(_PROFILES)

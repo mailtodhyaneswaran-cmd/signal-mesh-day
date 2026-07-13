@@ -49,7 +49,7 @@ from typing import Optional
 
 import config
 import data_loader
-from orb_core import ORBConfig, Bar, simulate_session
+from strategy_orb import ORBConfig, Bar, simulate_session
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────────
@@ -179,11 +179,11 @@ def _run_session(
 ):
     """Route one session to the correct simulate function."""
     if strategy == "ib":
-        from ib_strategy import simulate_ib_session
+        from strategy_ib import simulate_ib_session
         return simulate_ib_session(bars, capital_usd, config.INTRADAY_PARAMS,
                                    bias=bias, verbose=verbose)
     elif strategy == "vwap":
-        from vwap_strategy import simulate_vwap_session
+        from strategy_vwap import simulate_vwap_session
         return simulate_vwap_session(bars, capital_usd, config.INTRADAY_PARAMS,
                                      bias=bias, verbose=verbose)
     else:  # orb

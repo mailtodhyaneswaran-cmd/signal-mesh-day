@@ -54,7 +54,7 @@ os.environ.setdefault("MISTRAL_API_KEY", getattr(config, "MISTRAL_API_KEY", ""))
 
 import ibkr_connector
 import data_loader
-from orb_core import (
+from strategy_orb import (
     ORBConfig, capture_opening_range, simulate_session,
     rvol as compute_rvol,
 )

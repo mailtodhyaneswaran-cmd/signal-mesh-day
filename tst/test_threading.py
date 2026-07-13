@@ -1,5 +1,5 @@
 """
-test_threading.py -- Offline threading tests for orb_strategy.py
+test_threading.py -- Offline threading tests for session_runtime.py
 
 No IBKR connection required. No market hours required. Runs any day.
 
@@ -164,7 +164,7 @@ def test_eod_safety_flatten() -> bool:
     _section("Test 3: EOD safety flatten -- mocked IBKR positions")
 
     # Import after patching so we get the real function body
-    from orb_strategy import _eod_safety_flatten
+    from session_runtime import _eod_safety_flatten
 
     # Build mock position for NVDA (in watchlist) and MSFT (not in watchlist)
     def _mock_position(symbol, qty):
@@ -183,11 +183,11 @@ def test_eod_safety_flatten() -> bool:
 
     calls = []
 
-    with patch("orb_strategy.ibkr_connector.close_position_at_market",
+    with patch("session_runtime.ibkr_connector.close_position_at_market",
                side_effect=lambda ib, contract, direction, qty: calls.append(
                    {"symbol": contract.symbol, "direction": direction, "qty": qty}
                )):
-        with patch("orb_strategy.send_message"):
+        with patch("session_runtime.send_message"):
             actionable = [{"ticker": "NVDA"}, {"ticker": "TSLA"}]  # watchlist
             _eod_safety_flatten(mock_ib, actionable)
 
@@ -226,7 +226,7 @@ def _summary(results: dict) -> bool:
 # -- CLI -----------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Offline threading tests for orb_strategy.py")
+    p = argparse.ArgumentParser(description="Offline threading tests for session_runtime.py")
     p.add_argument("--lock",   action="store_true", help="State lock test only")
     p.add_argument("--timing", action="store_true", help="Concurrent timing test only")
     p.add_argument("--eod",    action="store_true", help="EOD flatten test only")

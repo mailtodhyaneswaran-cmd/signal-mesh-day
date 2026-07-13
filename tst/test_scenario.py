@@ -51,7 +51,7 @@ from pathlib import Path
 
 import config
 import data_loader
-from orb_core import ORBConfig
+from strategy_orb import ORBConfig
 from regime import pick_strategy, RegimeScore
 from backtest import (
     _trading_days, _risk_usd, _run_session,

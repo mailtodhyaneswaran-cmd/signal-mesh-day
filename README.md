@@ -17,22 +17,23 @@ signal-mesh-day/
 │
 ├── bin/                    Executable entry points
 │   ├── day_orchestrator.py Premarket screener: S&P 500 → AI mesh → watchlist
-│   ├── live_engine.py      Unified live runner — dispatches ORB / IB / VWAP
-│   ├── orb_strategy.py     ORB-only engine (kept for direct use / backward compat)
+│   ├── live_engine.py      Pure dispatcher — loads watchlist, calls strategy_xxx.run()
 │   ├── backtest.py         Multi-strategy backtester (--strategy orb|ib|vwap)
 │   ├── run_screener.bat    Task Scheduler launcher: 14:55 NL
 │   └── run_us.bat          Task Scheduler launcher: 15:30 NL → live_engine.py
 │
 ├── inc/                    Abstract classes / interfaces
-│   ├── strategy_base.py    Strategy Protocol + StrategySignal + STRATEGY_REGISTRY
 │   └── lib_agents.py       BaseAgent ABC (implemented by Claude / Mistral / Mock)
 │
 ├── lib/                    Concrete strategy + library code
-│   ├── orb_core.py         ORB primitives: range, breakout, retest, bracket, simulate
-│   ├── ib_strategy.py      60-min Initial Balance breakout (reuses orb_core)
-│   ├── vwap_strategy.py    VWAP reversion: compute_vwap, detect_setup, simulate
+│   ├── strategy_orb.py     ORB: range/breakout/retest/bracket/simulate + live run()
+│   ├── strategy_ib.py      IB 60-min Initial Balance breakout (reuses strategy_orb) + run()
+│   ├── strategy_vwap.py    VWAP reversion: compute_vwap, detect_setup, simulate + run()
+│   ├── session_runtime.py  Shared live-engine plumbing: sizing, state I/O, force-fill,
+│   │                       bracket monitor, EOD flatten — used by every strategy
 │   ├── regime.py           Regime scoring → pick_strategy() + fallback chain
-│   ├── ibkr_connector.py   ib_async wrapper: connect, bars, RVOL, brackets, EUR/USD
+│   ├── ibkr_connector.py   THE ONLY IBKR gateway: connect, get_historical_bars
+│   │                       (serialised + retried + auto-qualified), brackets, EUR/USD
 │   ├── telegram_notify.py  HTML Telegram with 429 retry
 │   ├── premarket_data.py   Gap scan enrichment (real RVOL via IBKR premarket bars)
 │   ├── sp500_universe.py   S&P 500 tickers (Wikipedia scrape, weekly cache)

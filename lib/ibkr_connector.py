@@ -1,14 +1,24 @@
 """
-ibkr_connector.py — thin ib_async wrapper for Signal Mesh Day.
+ibkr_connector.py — the ONLY module that talks to IBKR.
+
+Every strategy (lib/strategy_orb.py, strategy_ib.py, strategy_vwap.py) and
+bin/live_engine.py must go through this module for anything IBKR-related:
+connecting, contracts, historical bars, account data, and order placement.
+No other file should import ib_async or call ib.reqHistoricalData directly.
 
 Adapted from candle-scalping-bot/ibkr_connector.py.
 Key additions vs the reference:
+  - get_historical_bars()  — single serialised/retried/auto-qualified fetch
+    point; fixes the IBKR pacing "thundering herd" (Error 366 / timeouts)
+    for every strategy at once instead of patching one strategy at a time.
   - get_eurusd_rate()  — live EUR→USD conversion for position sizing
   - get_contract() accepts a pre-qualified contract or builds one from symbol
 """
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
 import datetime as _dt
 import json as _json
+import threading as _threading
+import time as _time
 from collections import defaultdict as _defaultdict
 from pathlib import Path as _Path
 
@@ -24,6 +34,11 @@ _ET = ZoneInfo("America/New_York")
 
 # Disk cache for avg premarket volume (keyed by symbol + date + lookback days)
 from setup_paths import RVOL_CACHE_DIR as _RVOL_CACHE_DIR
+
+# Serialises every reqHistoricalData call across all threads/strategies —
+# IBKR pacing rules return Error 366 for overlapping historical requests.
+# This is the ONE lock; every strategy shares it via get_historical_bars().
+_HIST_LOCK = _threading.Lock()
 
 
 def connect() -> IB:
@@ -97,13 +112,58 @@ def get_eurusd_rate() -> float:
     return 1.08
 
 
+def get_historical_bars(
+    ib:            IB,
+    contract:      Stock,
+    duration_str:  str,
+    bar_size:      str,
+    use_rth:       bool           = True,
+    end_date_time: str            = "",   # "" = now; or "YYYYMMDD HH:MM:SS" for a specific date
+    retries:       int | None     = None,
+    retry_delay:   float | None   = None,
+):
+    """The ONE place every strategy/helper fetches historical bars from.
+
+    Qualifies the contract (skipped if already qualified), then fetches
+    under `_HIST_LOCK` so concurrent per-ticker threads never overlap their
+    reqHistoricalData calls — IBKR pacing rules return Error 366 / timeouts
+    for overlapping requests, regardless of which strategy is running.
+    Retries on an empty result (IBKR sometimes returns [] transiently while
+    a subscription warms up) before giving up.
+
+    Returns the raw ib_async BarDataList, or [] if every attempt was empty.
+    """
+    retries     = config.IBKR_HIST_RETRIES      if retries     is None else retries
+    retry_delay = config.IBKR_HIST_RETRY_DELAY_SEC if retry_delay is None else retry_delay
+
+    if not contract.conId:
+        try:
+            ib.qualifyContracts(contract)
+        except Exception as e:
+            print(f"[ibkr_connector] qualifyContracts({contract.symbol}) failed: {e}")
+
+    for attempt in range(retries):
+        with _HIST_LOCK:
+            try:
+                bars = ib.reqHistoricalData(
+                    contract, endDateTime=end_date_time,
+                    durationStr=duration_str, barSizeSetting=bar_size,
+                    whatToShow="TRADES", useRTH=use_rth, formatDate=1,
+                )
+            except Exception as e:
+                print(f"[ibkr_connector] reqHistoricalData({contract.symbol}) "
+                      f"attempt {attempt+1}/{retries} EXCEPTION: {type(e).__name__}: {e}")
+                bars = []
+        if bars:
+            return bars
+        if attempt < retries - 1:
+            _time.sleep(retry_delay)
+    return []
+
+
 def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str):
     """Return the 5-min bar that starts at opening_time (NL local HH:MM), or None."""
-    bars = ib.reqHistoricalData(
-        contract, endDateTime="", durationStr="3600 S",
-        barSizeSetting="5 mins", whatToShow="TRADES",
-        useRTH=True, formatDate=1,
-    )
+    bars = get_historical_bars(ib, contract, "3600 S", "5 mins", use_rth=True)
     for bar in bars:
         if bar.date.astimezone(NL).strftime("%H:%M") == opening_time:
             return bar
@@ -112,11 +172,7 @@ def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str):
 
 def get_latest_closed_1min_bar(ib: IB, contract: Stock):
     """Return the most recently fully closed 1-min bar."""
-    bars = ib.reqHistoricalData(
-        contract, endDateTime="", durationStr="1800 S",
-        barSizeSetting="1 min", whatToShow="TRADES",
-        useRTH=True, formatDate=1,
-    )
+    bars = get_historical_bars(ib, contract, "1800 S", "1 min", use_rth=True)
     if len(bars) < 2:
         return None
     return bars[-2]
@@ -125,16 +181,12 @@ def get_latest_closed_1min_bar(ib: IB, contract: Stock):
 def get_rvol(ib: IB, contract: Stock, current_volume: float) -> float:
     """Intraday RVOL: current 1-min bar volume vs median of last 10 closed bars.
 
-    Used at BREAKOUT DETECTION time (Phase 2 / orb_strategy.py).
+    Used at BREAKOUT DETECTION time by the live strategies.
     This is DIFFERENT from premarket RVOL (Phase 1 screener) — see
     get_premarket_volume_ibkr() and get_avg_premarket_volume_ibkr().
     Returns 1.0 on failure (neutral — passes the gate but logs clearly).
     """
-    bars = ib.reqHistoricalData(
-        contract, endDateTime="", durationStr="1800 S",
-        barSizeSetting="1 min", whatToShow="TRADES",
-        useRTH=True, formatDate=1,
-    )
+    bars = get_historical_bars(ib, contract, "1800 S", "1 min", use_rth=True)
     recent_vols = [b.volume for b in bars[-11:-1] if b.volume > 0]
     if not recent_vols:
         return 1.0
@@ -150,11 +202,7 @@ def get_premarket_volume_ibkr(ib: IB, contract: Stock) -> int:
     Returns 0 on failure.
     """
     try:
-        bars = ib.reqHistoricalData(
-            contract, endDateTime="", durationStr="23400 S",
-            barSizeSetting="1 min", whatToShow="TRADES",
-            useRTH=False, formatDate=1,
-        )
+        bars = get_historical_bars(ib, contract, "23400 S", "1 min", use_rth=False)
         pm_open   = _dt.time(4, 0)
         pm_cutoff = _dt.time(9, 30)
         total = 0

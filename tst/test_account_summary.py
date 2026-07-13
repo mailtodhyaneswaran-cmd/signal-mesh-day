@@ -91,7 +91,7 @@ def run_test() -> bool:
     print("\n" + "─" * 60)
     print("  STEP 4: risk_usd derived from live account vs config fallback")
     print("─" * 60)
-    from orb_strategy import _risk_usd, _max_notional
+    from session_runtime import _risk_usd, _max_notional
     live_risk    = _risk_usd(account)
     config_risk  = _risk_usd(None)
     live_max_n   = _max_notional(account)

@@ -21,7 +21,7 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from orb_core import Bar
+from strategy_orb import Bar
 
 from setup_paths import DATA_DIR as CACHE_DIR  # dat/data/
 PACING_SLEEP_SEC = 11          # between individual IBKR requests (avoids 60-req/10-min)
@@ -73,18 +73,10 @@ def _fetch_from_ibkr(ib, ticker: str, d: date) -> list[Bar]:
     contract = ibkr_connector.get_contract(ticker)
     end_dt   = f"{d.strftime('%Y%m%d')} 22:00:00"
 
-    try:
-        raw = ib.reqHistoricalData(
-            contract,
-            endDateTime    = end_dt,
-            durationStr    = "1 D",
-            barSizeSetting = "1 min",
-            whatToShow     = "TRADES",
-            useRTH         = True,
-            formatDate     = 1,
-        )
-    except Exception as e:
-        print(f"  [data_loader] IBKR fetch failed {ticker} {d}: {e}")
+    raw = ibkr_connector.get_historical_bars(
+        ib, contract, "1 D", "1 min", use_rth=True, end_date_time=end_dt,
+    )
+    if not raw:
         time.sleep(PACING_SLEEP_SEC)
         return []
 
@@ -156,18 +148,10 @@ def _fetch_premarket_from_ibkr(ib, ticker: str, d: date) -> list[Bar]:
     contract = ibkr_connector.get_contract(ticker)
     end_dt   = f"{d.strftime('%Y%m%d')} 15:30:00"   # 09:30 ET in NL time
 
-    try:
-        raw = ib.reqHistoricalData(
-            contract,
-            endDateTime    = end_dt,
-            durationStr    = "23400 S",
-            barSizeSetting = "1 min",
-            whatToShow     = "TRADES",
-            useRTH         = False,        # include premarket bars
-            formatDate     = 1,
-        )
-    except Exception as e:
-        print(f"  [data_loader] premarket fetch failed {ticker} {d}: {e}")
+    raw = ibkr_connector.get_historical_bars(
+        ib, contract, "23400 S", "1 min", use_rth=False, end_date_time=end_dt,
+    )
+    if not raw:
         time.sleep(PACING_SLEEP_SEC)
         return []
 

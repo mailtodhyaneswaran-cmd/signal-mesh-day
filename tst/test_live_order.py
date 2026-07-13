@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 
 import config
 import ibkr_connector
-from orb_core import ORBConfig, Bar, capture_opening_range, position_size_usd
+from strategy_orb import ORBConfig, Bar, capture_opening_range, position_size_usd
 from telegram_notify import send_message
 
 NL = ZoneInfo("Europe/Amsterdam")
@@ -120,7 +120,7 @@ def _fetch_today_rth_bars(ib, contract) -> list[Bar]:
     except Exception as e:
         print(f"  IBKR historical data error: {e}")
         return []
-
+    print(raw)
     bars = []
     for b in raw:
         bar_date = b.date.astimezone(NL)
