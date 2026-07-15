@@ -138,6 +138,10 @@ def main() -> None:
     print(f"  Signal Mesh Day — Live Engine")
     print(f"  {datetime.now(NL).strftime('%Y-%m-%d %H:%M')} NL")
     print(f"  LIVE_TRADING={config.LIVE_TRADING}  PROFILE={config.PROFILE}")
+    _delay = getattr(config, "MARKET_DATA_DELAY_MIN", 0)
+    if _delay:
+        print(f"  MARKET_DATA_DELAY_MIN={_delay}  (DELAYED feed — strategies read "
+              f"bars {_delay}m late; set 0 once real-time data is enabled)")
     print(f"{'='*60}\n")
 
     # Load watchlist and read strategy chosen by regime detection

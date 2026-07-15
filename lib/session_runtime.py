@@ -15,7 +15,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -57,6 +57,12 @@ def _et_nl_hhmm(et_hhmm: str) -> str:
     the real DST offset instead of a hardcoded assumption.
     """
     return _et_today_at(et_hhmm).strftime("%H:%M")
+
+
+def _data_delay() -> timedelta:
+    """Extra wait before a just-formed bar is readable, from
+    config.MARKET_DATA_DELAY_MIN (0 = real-time subscription). See config."""
+    return timedelta(minutes=getattr(config, "MARKET_DATA_DELAY_MIN", 0))
 
 
 def _ts() -> str:

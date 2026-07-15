@@ -32,7 +32,7 @@ import ibkr_connector
 from profiles import get_profile
 from session_runtime import (
     _SIGNAL_TO_DIRECTION,
-    _risk_usd, _max_notional, _wait_until,
+    _risk_usd, _max_notional, _wait_until, _data_delay,
     _et_today_at, _et_nl_hhmm,
     ET_OPEN, ET_ORB_RANGE_END, ET_ORB_WINDOW_END, ET_SESSION_END,
     _save_state, _force_fill, _monitor_bracket,
@@ -484,8 +484,9 @@ def run(
     direction = _SIGNAL_TO_DIRECTION.get(signal, "skip")
     currency  = pick.get("currency", "USD")
     cfg       = ORBConfig.from_params(config.INTRADAY_PARAMS)
+    delay       = _data_delay()          # 0 with real-time data; ~16m on delayed feed
     session_end = _et_today_at(ET_SESSION_END)
-    window_end  = window_end_override or _et_today_at(ET_ORB_WINDOW_END)
+    window_end  = window_end_override or (_et_today_at(ET_ORB_WINDOW_END) + delay)
     open_nl     = _et_nl_hhmm(ET_OPEN)   # NL "HH:MM" of the 09:30 ET opening bar
 
     # ── Apply profile overrides to cfg ────────────────────────────────────────
@@ -526,13 +527,15 @@ def run(
             print(f"{ticker}: trade already taken today — skipping.")
             return False
 
+    read_at = _et_today_at(ET_ORB_RANGE_END) + delay
     send_message(
         f"🔔 Watching <b>{ticker}</b> for ORB  ·  bias: {direction.upper()}\n"
-        f"  Waiting for {open_nl} NL candle close..."
+        f"  Opening range {open_nl} NL; reading it at {read_at.strftime('%H:%M')} NL"
+        + (f" (+{int(delay.total_seconds()//60)}m data delay)" if delay else "")
     )
 
-    # ── Wait for opening range to form ───────────────────────────────────────
-    _wait_until(_et_today_at(ET_ORB_RANGE_END))
+    # ── Wait for opening range to form AND become readable in the feed ──────
+    _wait_until(read_at)
 
     contract    = ibkr_connector.get_contract(ticker, "SMART", currency)
     # Poll for the opening bar to appear (IBKR may take a few seconds to serve
@@ -546,6 +549,20 @@ def run(
         time.sleep(5)
 
     if opening_bar is None:
+        # try_luck: rather than skip on a data hiccup, force a synthetic entry
+        # from the last available price (mirrors strategy_ib's no-bars fallback,
+        # so ORB actually places an order in force-fill mode instead of bailing).
+        if profile.get("force_trade") and allow_force_fill:
+            last_bar = ibkr_connector.get_latest_closed_1min_bar(ib, contract)
+            if last_bar:
+                p = last_bar.close
+                synth = OpeningRange(ticker=ticker,
+                                     high=round(p * 1.005, 2), low=round(p * 0.995, 2))
+                send_message(f"⚠️ {ticker}: opening candle unavailable — "
+                             f"forcing synthetic entry at {p:.2f}")
+                _force_fill(ticker, ib, contract, synth, direction, cfg, profile,
+                            account_summary, state, state_lock, session_end, currency)
+                return True
         msg = f"⚠️ {ticker}: opening candle not available — skipping."
         print(msg); send_message(msg)
         return False

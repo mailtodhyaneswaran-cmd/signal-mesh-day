@@ -25,6 +25,13 @@ IBKR_CLIENT_ID_SCREENER  = 37    # premarket screener — distinct so an overrun
 IBKR_HIST_RETRIES         = 10   # attempts before giving up on an empty result
 IBKR_HIST_RETRY_DELAY_SEC = 15   # seconds between attempts
 
+# Market-data delay (minutes). 0 assumes a REAL-TIME market-data subscription
+# (shared with the paper account). If the account only has 15-min DELAYED data
+# (IBKR Error 10089), set this to ~16 so strategies wait for the delayed bar to
+# appear before reading it — otherwise every read fails "opening candle not
+# available". Delayed mode trades on stale prices (pipeline validation only).
+MARKET_DATA_DELAY_MIN = 0
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
 TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID"

@@ -49,7 +49,7 @@ import ibkr_connector
 from profiles import get_profile
 from session_runtime import (
     _SIGNAL_TO_DIRECTION,
-    _risk_usd, _max_notional, _wait_until,
+    _risk_usd, _max_notional, _wait_until, _data_delay,
     _et_today_at, _et_nl_hhmm,
     ET_OPEN, ET_VWAP_WINDOW_END, ET_SESSION_END,
     _save_state, _force_fill, _monitor_bracket,
@@ -197,8 +197,9 @@ def run(
     signal      = pick.get("signal", "HOLD")
     direction   = _SIGNAL_TO_DIRECTION.get(signal, "skip")
     currency    = pick.get("currency", "USD")
+    delay       = _data_delay()          # 0 with real-time data; ~16m on delayed feed
     session_end = _et_today_at(ET_SESSION_END)
-    window_end  = window_end_override or _et_today_at(ET_VWAP_WINDOW_END)
+    window_end  = window_end_override or (_et_today_at(ET_VWAP_WINDOW_END) + delay)
     open_nl     = _et_nl_hhmm(ET_OPEN)   # 09:30 ET in NL
 
     if direction == "skip":
@@ -213,8 +214,9 @@ def run(
     polls_per_sec = config.INTRADAY_PARAMS.poll_interval_sec
     contract      = ibkr_connector.get_contract(ticker, "SMART", currency)
 
-    # Fetch all bars since open to seed the VWAP history
-    _wait_until(_et_today_at(ET_OPEN))
+    # Fetch all bars since open to seed the VWAP history (wait for the delayed
+    # feed to actually have post-open bars before seeding).
+    _wait_until(_et_today_at(ET_OPEN) + delay)
     seed_raw = ibkr_connector.get_historical_bars(
         ib, contract, "3600 S", "1 min", use_rth=True,
     )
