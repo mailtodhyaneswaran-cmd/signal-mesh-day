@@ -327,23 +327,53 @@ def get_historical_bars(
 _POLL_RETRIES = 1
 
 
-def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str):
-    """Return today's 5-min opening bar at opening_time (NL local HH:MM), or None.
+def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str,
+                          minutes: int | None = None):
+    """Return today's opening range (first `minutes` of the session) as a single
+    aggregated bar, or None if those bars aren't all served yet.
 
-    Uses a session-spanning duration (8h RTH) rather than a 1-hour window: a
-    small rolling window scrolls the 09:30 ET opening bar out within an hour, so
-    the exact-time match silently failed all session (the "opening candle not
-    available" bug). Filters to TODAY so it can't match yesterday's same-time bar
-    that IBKR backfills into the window early in the session.
+    Built from 1-MINUTE bars rather than the single N-min bar because:
+      - 1-min bars are served individually and faster, so this doesn't depend on
+        IBKR having finalised/aggregated the N-min opening bar the instant it
+        closes (the likely cause of "opening candle not available" at the open);
+      - a session-spanning duration (8h RTH) + a TODAY filter means the opening
+        bar is always in-window and can't match yesterday's same-time bar that
+        IBKR backfills early in the session (a small rolling window scrolls the
+        opening bar out within an hour).
+
+    The five 1-min bars aggregate to exactly the same high/low as the 5-min bar
+    (verified live). Returns an object with .date/.open/.high/.low/.close/.volume,
+    matching what the raw bar exposed.
     """
-    bars = get_historical_bars(ib, contract, "28800 S", "5 mins", use_rth=True,
+    from types import SimpleNamespace
+    minutes = getattr(config.INTRADAY_PARAMS, "orb_range_minutes", 5) if minutes is None else minutes
+    bars = get_historical_bars(ib, contract, "28800 S", "1 min", use_rth=True,
                                retries=_POLL_RETRIES)
-    today = _dt.datetime.now(NL).date()
-    for bar in bars:
-        d = bar.date.astimezone(NL)
-        if d.date() == today and d.strftime("%H:%M") == opening_time:
-            return bar
-    return None
+    today  = _dt.datetime.now(NL).date()
+    oh, om = map(int, opening_time.split(":"))
+    open_minute = oh * 60 + om
+
+    window = []
+    for b in bars:
+        d = b.date.astimezone(NL)
+        if d.date() != today:
+            continue
+        delta = (d.hour * 60 + d.minute) - open_minute
+        if 0 <= delta < minutes:
+            window.append(b)
+
+    if len(window) < minutes:
+        return None   # opening bars not all served yet — caller polls again
+
+    window.sort(key=lambda b: b.date)
+    return SimpleNamespace(
+        date   = window[0].date,
+        open   = window[0].open,
+        high   = max(b.high for b in window),
+        low    = min(b.low  for b in window),
+        close  = window[-1].close,
+        volume = sum(b.volume for b in window),
+    )
 
 
 def get_latest_closed_1min_bar(ib: IB, contract: Stock):
