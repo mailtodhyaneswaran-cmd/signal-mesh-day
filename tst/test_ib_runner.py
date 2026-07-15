@@ -54,10 +54,13 @@ _FAIL = "  FAIL"
 _SKIP = "  SKIP"
 
 
-# ── Test 1: Retry logic ───────────────────────────────────────────────────────
+# ── Test 1: Retry logic (async fetch path) ────────────────────────────────────
 
 def test_retry_logic() -> bool:
-    """get_historical_bars() must retry on an empty result until bars come back."""
+    """get_historical_bars() must retry on an empty result until bars come back.
+
+    Mocks the async fetch (reqHistoricalDataAsync). On the owner thread (offline,
+    no loop set), get_historical_bars runs the coroutine directly via _submit."""
     print("\n" + "-" * 56)
     print("  Test 1: get_historical_bars() retry logic (offline / mock)")
     print("-" * 56)
@@ -65,13 +68,14 @@ def test_retry_logic() -> bool:
     for fail_first_n in [0, 1, 2, 4]:
         call_count = 0
 
-        def mock_req(*_, **__):
+        async def mock_req_async(*_, **__):
             nonlocal call_count
             call_count += 1
             return [] if call_count <= fail_first_n else [MagicMock()]
 
         mock_ib = MagicMock()
-        mock_ib.reqHistoricalData.side_effect = mock_req
+        mock_ib.isConnected.return_value = True
+        mock_ib.reqHistoricalDataAsync = mock_req_async
         mock_contract = MagicMock(conId=12345, symbol="NVDA")  # already qualified
 
         bars = ibkr_connector.get_historical_bars(
@@ -81,14 +85,20 @@ def test_retry_logic() -> bool:
 
         expected_calls = fail_first_n + 1  # succeed on attempt fail_first_n+1
         if call_count != expected_calls or not bars:
-            print(f"  fail_first_n={fail_first_n}: called {call_count}× "
+            print(f"  fail_first_n={fail_first_n}: called {call_count}x "
                   f"(expected {expected_calls}) bars={bool(bars)}  {_FAIL}")
             return False
         print(f"  fail_first_n={fail_first_n}: succeeded on attempt {call_count}/5  {_PASS}")
 
-    # Edge case: all 5 fail → should return []
+    # Edge case: all 5 fail -> should return []
+    call_count = 0
+
+    async def always_empty(*_, **__):
+        return []
+
     mock_ib = MagicMock()
-    mock_ib.reqHistoricalData.return_value = []
+    mock_ib.isConnected.return_value = True
+    mock_ib.reqHistoricalDataAsync = always_empty
     mock_contract = MagicMock(conId=12345, symbol="NVDA")
     bars = ibkr_connector.get_historical_bars(
         mock_ib, mock_contract, "3600 S", "1 min", retries=5, retry_delay=0,
@@ -102,64 +112,36 @@ def test_retry_logic() -> bool:
     return True
 
 
-# ── Test 2: Serialisation ──────────────────────────────────────────────────────
+# ── Test 2: Threading model (owner vs worker) ─────────────────────────────────
 
-def test_serialisation() -> bool:
-    """3 threads calling get_historical_bars() concurrently must never overlap
-    their reqHistoricalData calls — _HIST_LOCK should serialise them."""
+def test_threading_model() -> bool:
+    """On the loop-owner thread (no loop set offline), _call_ib / _submit run the
+    work directly (no marshalling). This is the invariant that lets the screener
+    and the main thread call IBKR sync while workers marshal onto the loop."""
     print("\n" + "-" * 56)
-    print("  Test 2: get_historical_bars() serialisation (offline / mock)")
+    print("  Test 2: threading model owner-thread pass-through (offline)")
     print("-" * 56)
 
-    overlap_detected = threading.Event()
-    active = threading.Lock()
-    currently_running = {"n": 0}
-    guard = threading.Lock()
-
-    def mock_req(*_, **__):
-        with guard:
-            currently_running["n"] += 1
-            if currently_running["n"] > 1:
-                overlap_detected.set()
-        time.sleep(0.2)   # simulate a slow IBKR round-trip
-        with guard:
-            currently_running["n"] -= 1
-        return [MagicMock()]
-
-    def _fetch(results, idx):
-        mock_ib = MagicMock()
-        mock_ib.reqHistoricalData.side_effect = mock_req
-        mock_contract = MagicMock(conId=12345, symbol=f"T{idx}")
-        bars = ibkr_connector.get_historical_bars(
-            mock_ib, mock_contract, "3600 S", "1 min", retries=1,
-        )
-        results[idx] = bool(bars)
-
-    results = {}
-    threads = [
-        threading.Thread(target=_fetch, args=(results, i), daemon=True)
-        for i in range(3)
-    ]
-    t0 = time.monotonic()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5)
-    elapsed = time.monotonic() - t0
-
-    if overlap_detected.is_set():
-        print(f"  Two or more reqHistoricalData calls ran concurrently  {_FAIL}")
+    # _LOOP is None offline -> current thread is treated as the owner.
+    if not ibkr_connector._on_loop_thread():
+        print(f"  _on_loop_thread() should be True when no loop is set  {_FAIL}")
         return False
-    if not all(results.values()):
-        print(f"  Not all threads got bars: {results}  {_FAIL}")
-        return False
-    # 3 calls serialised at 0.2s each should take >= ~0.6s wall time
-    print(f"  3 calls completed serially in {elapsed:.2f}s (expected >= 0.5s)")
-    if elapsed < 0.5:
-        print(f"  Calls finished too fast to have been serialised  {_FAIL}")
-        return False
+    print(f"  _on_loop_thread() True with no loop set  {_PASS}")
 
-    print(f"\n  Serialisation: {_PASS}")
+    if ibkr_connector._call_ib(lambda: 42) != 42:
+        print(f"  _call_ib did not pass through on owner thread  {_FAIL}")
+        return False
+    print(f"  _call_ib(lambda: 42) == 42 on owner thread  {_PASS}")
+
+    async def _co():
+        return "ok"
+
+    if ibkr_connector._submit(_co(), timeout=5) != "ok":
+        print(f"  _submit did not run coroutine on owner thread  {_FAIL}")
+        return False
+    print(f"  _submit(coroutine) ran directly on owner thread  {_PASS}")
+
+    print(f"\n  Threading model: {_PASS}")
     return True
 
 
@@ -226,8 +208,8 @@ def main() -> None:
     print("=" * 56)
 
     results = {}
-    results["1_retry_logic"]    = test_retry_logic()
-    results["2_serialisation"]  = test_serialisation()
+    results["1_retry_logic"]     = test_retry_logic()
+    results["2_threading_model"] = test_threading_model()
     if args.live:
         results["3_live_ib_bars"] = test_live_ib_bars(args.ticker)
 

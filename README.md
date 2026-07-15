@@ -83,7 +83,15 @@ signal-mesh-day/
 ─────────────────────────────────────────────────────
   Reads watchlist (waits, with Telegram alert if screener is late)
   → startup reconcile (cancel stale orders, report open positions)
-  → strategy field → dispatches:
+  → strategy field → dispatches one thread per pick.
+
+  Threading model (important): ib_async runs ONE asyncio event loop. The main
+  thread keeps that loop running (ibkr_connector.run_threads_pumping); worker
+  threads never call ib.* directly — they MARSHAL every IBKR call onto the loop
+  via ibkr_connector (_submit / _call_ib). A worker calling ib.reqHistoricalData
+  itself hangs forever (the socket lives on the main loop) — that was the
+  2026-07-14 wedge.
+
 
   ORB  (gap + RVOL days)     wait 09:35 ET, 5-min range, breakout+retest
   IB   (moderate-gap days)   wait 10:30 ET, 60-min range, breakout+retest

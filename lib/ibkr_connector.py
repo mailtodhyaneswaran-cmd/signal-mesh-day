@@ -8,13 +8,16 @@ No other file should import ib_async or call ib.reqHistoricalData directly.
 
 Adapted from candle-scalping-bot/ibkr_connector.py.
 Key additions vs the reference:
-  - get_historical_bars()  — single serialised/retried/auto-qualified fetch
-    point; fixes the IBKR pacing "thundering herd" (Error 366 / timeouts)
-    for every strategy at once instead of patching one strategy at a time.
+  - Thread-safe access model: ib_async's event loop runs on the owner (main)
+    thread via pump_until()/run_threads_pumping(); worker threads MARSHAL their
+    IBKR calls onto it (_submit/_call_ib). This is what makes the per-ticker
+    threaded live engine actually work — a worker calling ib.* directly hangs.
+  - get_historical_bars()  — single retried/auto-qualified fetch point.
   - get_eurusd_rate()  — live EUR→USD conversion for position sizing
   - get_contract() accepts a pre-qualified contract or builds one from symbol
 """
 import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent)); import setup_paths  # noqa: E402
+import asyncio as _asyncio
 import datetime as _dt
 import json as _json
 import threading as _threading
@@ -25,7 +28,7 @@ from pathlib import Path as _Path
 import yfinance as yf
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, Stock, LimitOrder, MarketOrder, StopOrder
+from ib_async import IB, Stock, LimitOrder, MarketOrder, StopOrder, util as _ibutil
 
 import config
 
@@ -35,10 +38,98 @@ _ET = ZoneInfo("America/New_York")
 # Disk cache for avg premarket volume (keyed by symbol + date + lookback days)
 from setup_paths import RVOL_CACHE_DIR as _RVOL_CACHE_DIR
 
-# Serialises every reqHistoricalData call across all threads/strategies —
-# IBKR pacing rules return Error 366 for overlapping historical requests.
-# This is the ONE lock; every strategy shares it via get_historical_bars().
-_HIST_LOCK = _threading.Lock()
+# ── ib_async threading model ──────────────────────────────────────────────────
+# ib_async drives ONE asyncio event loop, and the TWS socket reader lives on that
+# loop. Only the thread that owns the loop may run it. The live engine spawns one
+# thread per ticker; a worker thread that calls a sync ib method (reqHistoricalData,
+# qualifyContracts, ...) tries to run the loop itself while the socket's responses
+# are serviced on the OWNER loop — so the call blocks forever. That is exactly what
+# wedged the 2026-07-14 session (and why every prior session silently got empty
+# bars: reqHistoricalData timed out to [], qualifyContracts — no timeout — hung).
+#
+# Correct pattern: the loop keeps running on the OWNER thread (the main thread,
+# via pump_until()), and worker threads MARSHAL their IB calls onto it with
+# asyncio.run_coroutine_threadsafe(). _submit() / _call_ib() below do that; on the
+# owner thread they just call through directly (screener / pre-worker / post-join).
+_LOOP = None                       # the ib_async event loop (set on connect)
+_LOOP_OWNER_IDENT: int | None = None
+
+
+def _on_loop_thread() -> bool:
+    """True if the current thread owns/runs the ib_async loop (or none set yet)."""
+    return _LOOP is None or _threading.get_ident() == _LOOP_OWNER_IDENT
+
+
+def _submit(coro, timeout: float):
+    """Run an ib_async *coroutine* on the owner loop and return its result.
+
+    Owner thread: run directly. Worker thread: marshal via run_coroutine_threadsafe
+    (the owner thread must be pumping the loop, e.g. via pump_until)."""
+    if _on_loop_thread():
+        return _ibutil.run(coro)
+    fut = _asyncio.run_coroutine_threadsafe(coro, _LOOP)
+    try:
+        return fut.result(timeout=timeout)
+    except Exception:
+        fut.cancel()
+        raise
+
+
+def _call_ib(fn, timeout: float = 30):
+    """Run a *sync* callable that touches ib on the owner loop thread.
+
+    Used for non-coroutine ib ops (placeOrder, cancelOrder, positions, ...) so
+    they execute on the loop-owner thread instead of a worker thread."""
+    if _on_loop_thread():
+        return fn()
+
+    async def _wrap():
+        return fn()
+
+    fut = _asyncio.run_coroutine_threadsafe(_wrap(), _LOOP)
+    try:
+        return fut.result(timeout=timeout)
+    except Exception:
+        fut.cancel()
+        raise
+
+
+def pump(ib: IB, seconds: float) -> None:
+    """Advance `seconds` of time. On the loop-owner thread this pumps the event
+    loop (ib.sleep); on a worker thread it is a plain sleep (the owner thread
+    keeps the loop running, so fills/data still arrive)."""
+    if _on_loop_thread():
+        ib.sleep(seconds)
+    else:
+        _time.sleep(seconds)
+
+
+def pump_until(ib: IB, is_done, tick: float = 0.5) -> None:
+    """Run the ib_async loop on the CURRENT (owner) thread until is_done() is True.
+
+    The live engine / test harness call this on the main thread while worker
+    threads run, so worker IB calls marshalled via _submit()/_call_ib() are
+    serviced. Returns once is_done() returns True."""
+    while not is_done():
+        ib.sleep(tick)
+
+
+def run_threads_pumping(ib: IB, threads: list) -> None:
+    """Start worker threads and keep the ib loop running on this (owner) thread
+    until they all finish. Replaces `for t: t.start(); for t: t.join()` — a bare
+    join() would block the owner thread and starve the loop, hanging every
+    worker's marshalled IB call."""
+    done = _threading.Event()
+
+    def _joiner():
+        for t in threads:
+            t.join()
+        done.set()
+
+    for t in threads:
+        t.start()
+    _threading.Thread(target=_joiner, name="pump-joiner", daemon=True).start()
+    pump_until(ib, done.is_set)
 
 
 def connect(client_id: int | None = None) -> IB:
@@ -47,25 +138,30 @@ def connect(client_id: int | None = None) -> IB:
     client_id defaults to config.IBKR_CLIENT_ID (the live engine). The premarket
     screener passes config.IBKR_CLIENT_ID_SCREENER so an overrunning screener and
     the live engine never collide on the same client id (which IBKR rejects).
+
+    The calling thread becomes the loop owner — it must be the thread that later
+    runs pump_until()/run_threads_pumping() while worker threads marshal onto it.
     """
+    global _LOOP, _LOOP_OWNER_IDENT
     cid = config.IBKR_CLIENT_ID if client_id is None else client_id
     ib  = IB()
     ib.connect(config.IBKR_HOST, config.IBKR_PORT, clientId=cid)
+    _LOOP = _ibutil.getLoop()
+    _LOOP_OWNER_IDENT = _threading.get_ident()
     return ib
 
 
 def ensure_connected(ib: IB, client_id: int | None = None, attempts: int = 3) -> bool:
-    """Reconnect a dropped IBKR session in place.
+    """Reconnect a dropped IBKR session in place (owner thread only).
 
-    A mid-session network blip or TWS restart leaves ib disconnected and every
-    subsequent poll/order throws. Callers guard their IBKR calls with this so a
-    blip degrades to a short pause instead of killing the trading day.
-
-    Returns True if connected (already or after reconnect), False if all
-    attempts failed.
+    Returns True if connected. Reconnecting drives the loop, so it is only
+    attempted on the loop-owner thread; a worker that finds the session down
+    returns False and skips this cycle rather than corrupting the loop.
     """
     if ib.isConnected():
         return True
+    if not _on_loop_thread():
+        return False
     cid = config.IBKR_CLIENT_ID if client_id is None else client_id
     for attempt in range(attempts):
         try:
@@ -93,7 +189,7 @@ def get_account_summary(ib: IB, retries: int = 5, delay: float = 1.5) -> dict:
     import time as _time
     keys_wanted = {"NetLiquidation", "AvailableFunds", "BuyingPower"}
     for attempt in range(retries):
-        rows = ib.accountSummary()
+        rows = _call_ib(lambda: ib.accountSummary())
         found = {
             row.tag: float(row.value)
             for row in rows
@@ -172,24 +268,27 @@ def get_historical_bars(
         print(f"[ibkr_connector] get_historical_bars({contract.symbol}): not connected")
         return []
 
-    if not contract.conId:
-        try:
-            ib.qualifyContracts(contract)
-        except Exception as e:
-            print(f"[ibkr_connector] qualifyContracts({contract.symbol}) failed: {e}")
+    async def _fetch():
+        # Runs ON the loop-owner thread (directly on the owner, marshalled from a
+        # worker). qualify + fetch as one coroutine so a worker makes a single hop.
+        if not contract.conId:
+            try:
+                await ib.qualifyContractsAsync(contract)
+            except Exception as e:
+                print(f"[ibkr_connector] qualifyContracts({contract.symbol}) failed: {e}")
+        return await ib.reqHistoricalDataAsync(
+            contract, endDateTime=end_date_time,
+            durationStr=duration_str, barSizeSetting=bar_size,
+            whatToShow="TRADES", useRTH=use_rth, formatDate=1,
+        )
 
     for attempt in range(retries):
-        with _HIST_LOCK:
-            try:
-                bars = ib.reqHistoricalData(
-                    contract, endDateTime=end_date_time,
-                    durationStr=duration_str, barSizeSetting=bar_size,
-                    whatToShow="TRADES", useRTH=use_rth, formatDate=1,
-                )
-            except Exception as e:
-                print(f"[ibkr_connector] reqHistoricalData({contract.symbol}) "
-                      f"attempt {attempt+1}/{retries} EXCEPTION: {type(e).__name__}: {e}")
-                bars = []
+        try:
+            bars = _submit(_fetch(), timeout=60)
+        except Exception as e:
+            print(f"[ibkr_connector] reqHistoricalData({contract.symbol}) "
+                  f"attempt {attempt+1}/{retries} EXCEPTION: {type(e).__name__}: {e}")
+            bars = []
         if bars:
             return bars
         if attempt < retries - 1:
@@ -332,16 +431,18 @@ def _compute_avg_premarket_volume(
 def place_bracket_order(ib: IB, contract: Stock, action: str, qty: int,
                         entry_price: float, take_profit: float, stop_loss: float):
     """Limit-entry bracket order. Returns (parent, tp, sl) Trade tuple."""
-    bracket = ib.bracketOrder(action, qty, round(entry_price, 2),
-                              round(take_profit, 2), round(stop_loss, 2))
-    for order in bracket:
-        order.tif = "DAY"
-    return [ib.placeOrder(contract, order) for order in bracket]
+    def _place():
+        bracket = ib.bracketOrder(action, qty, round(entry_price, 2),
+                                  round(take_profit, 2), round(stop_loss, 2))
+        for order in bracket:
+            order.tif = "DAY"
+        return [ib.placeOrder(contract, order) for order in bracket]
+    return _call_ib(_place)
 
 
 def cancel_order(ib: IB, trade) -> None:
     try:
-        ib.cancelOrder(trade.order)
+        _call_ib(lambda: ib.cancelOrder(trade.order))
     except Exception:
         pass
 
@@ -350,4 +451,14 @@ def close_position_at_market(ib: IB, contract: Stock, direction: str, qty: int):
     """Market order to flatten an open position immediately."""
     action = "SELL" if direction == "long" else "BUY"
     order  = MarketOrder(action, qty, tif="DAY")
-    return ib.placeOrder(contract, order)
+    return _call_ib(lambda: ib.placeOrder(contract, order))
+
+
+def positions(ib: IB) -> list:
+    """ib.positions() executed on the loop-owner thread."""
+    return _call_ib(lambda: ib.positions())
+
+
+def open_trades(ib: IB) -> list:
+    """ib.openTrades() executed on the loop-owner thread."""
+    return _call_ib(lambda: ib.openTrades())

@@ -54,7 +54,8 @@ class ClaudeAgent(BaseAgent):
             print(f"{'─' * 60}")
         try:
             result = subprocess.run(
-                [self._claude_bin, "--print", "--dangerously-skip-permissions"],
+                [self._claude_bin, "--print", "--model", "sonnet",
+                 "--dangerously-skip-permissions"],
                 input=prompt,
                 capture_output=True,
                 encoding="utf-8",

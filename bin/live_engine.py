@@ -108,14 +108,14 @@ def _startup_reconcile(ib, actionable: list) -> None:
     """
     watchlist = {p["ticker"] for p in actionable}
     try:
-        ib.sleep(1)
-        open_trades = ib.openTrades()
+        ibkr_connector.pump(ib, 1)
+        open_trades = ibkr_connector.open_trades(ib)
         cancelled = 0
         for tr in open_trades:
             if tr.contract.symbol in watchlist and tr.orderStatus.status not in ("Filled", "Cancelled"):
                 ibkr_connector.cancel_order(ib, tr)
                 cancelled += 1
-        positions = [p for p in ib.positions()
+        positions = [p for p in ibkr_connector.positions(ib)
                      if p.contract.symbol in watchlist and p.position != 0]
         if cancelled or positions:
             lines = [f"⚠️ <b>Startup reconcile</b>: cancelled {cancelled} stale order(s)."]
@@ -232,13 +232,15 @@ def main() -> None:
             name=f"{strategy}-{pick['ticker']}",
             daemon=True,
         )
-        t.start()
         threads.append(t)
-        print(f"  [{_ts()}] [{pick['ticker']}] {strategy} thread started"
+        print(f"  [{_ts()}] [{pick['ticker']}] {strategy} thread queued"
               f"{' (waterfall)' if use_waterfall else ''}")
 
-    for t in threads:
-        t.join()
+    # Start the workers and keep the ib_async event loop running on THIS (main /
+    # loop-owner) thread until they all finish. Worker threads marshal their IBKR
+    # calls onto this loop via ibkr_connector — a bare join() here would starve the
+    # loop and hang every fetch (root cause of the 2026-07-14 wedge).
+    ibkr_connector.run_threads_pumping(ib, threads)
 
     print("\n  Running EOD safety flatten check...")
     _eod_safety_flatten(ib, actionable)

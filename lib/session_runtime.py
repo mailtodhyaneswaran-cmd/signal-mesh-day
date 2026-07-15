@@ -231,7 +231,7 @@ def _monitor_bracket(ib, contract, trades, direction, bracket, orng,
     stop        = bracket["stop"]
 
     while datetime.now(NL) < session_end:
-        ib.sleep(5)
+        ibkr_connector.pump(ib, 5)   # locked event-loop pump (thread-safe)
 
         if tp_trade.orderStatus.status == "Filled":
             fill   = tp_trade.orderStatus.avgFillPrice
@@ -253,14 +253,14 @@ def _monitor_bracket(ib, contract, trades, direction, bracket, orng,
             if reentered:
                 ibkr_connector.cancel_order(ib, tp_trade)
                 ibkr_connector.cancel_order(ib, sl_trade)
-                ib.sleep(1)
+                ibkr_connector.pump(ib, 1)
                 ibkr_connector.close_position_at_market(ib, contract, direction, bracket["qty"])
                 send_message(f"🚪 {ticker} re-entered range — exited at market.")
                 return
 
     ibkr_connector.cancel_order(ib, tp_trade)
     ibkr_connector.cancel_order(ib, sl_trade)
-    ib.sleep(1)
+    ibkr_connector.pump(ib, 1)
     ibkr_connector.close_position_at_market(ib, contract, direction, bracket["qty"])
     send_message(f"⏰ {ticker} EOD flatten — position closed at market.")
 
@@ -274,8 +274,8 @@ def _eod_safety_flatten(ib, actionable: list) -> None:
     placing a bracket but before the EOD flatten inside _monitor_bracket ran.
     """
     try:
-        ib.sleep(2)
-        positions = ib.positions()
+        ibkr_connector.pump(ib, 2)
+        positions = ibkr_connector.positions(ib)
         watchlist = {p["ticker"] for p in actionable}
         closed = 0
         for pos in positions:
