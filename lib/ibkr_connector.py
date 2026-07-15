@@ -54,6 +54,25 @@ from setup_paths import RVOL_CACHE_DIR as _RVOL_CACHE_DIR
 _LOOP = None                       # the ib_async event loop (set on connect)
 _LOOP_OWNER_IDENT: int | None = None
 
+# IBKR emits many benign informational "errors" (data-farm connection OK, etc.).
+# Suppress those so the log only shows the ones that actually explain a failure
+# (e.g. 162 HMDS no-data/pacing, 200 no contract, 354 not subscribed, 366 no
+# query, 420 pacing). Connectivity codes 1100/1101/1102 are kept — they matter.
+_BENIGN_IB_CODES = {
+    2104, 2106, 2107, 2108, 2109, 2110, 2119, 2137, 2150, 2158,
+    2100, 2103, 2105, 2157, 2168, 2169,
+}
+
+
+def _log_ib_error(reqId, code, msg, contract=None) -> None:
+    """Print real IBKR error events so run_us.log shows the underlying cause,
+    not just our app-level 'skipping' text. Attached to ib.errorEvent on connect."""
+    if code in _BENIGN_IB_CODES:
+        return
+    sym = getattr(contract, "symbol", "") if contract is not None else ""
+    print(f"[IBKR] reqId={reqId} code={code}: {msg}"
+          + (f"  [{sym}]" if sym else ""), flush=True)
+
 
 def _on_loop_thread() -> bool:
     """True if the current thread owns/runs the ib_async loop (or none set yet)."""
@@ -148,6 +167,11 @@ def connect(client_id: int | None = None) -> IB:
     ib.connect(config.IBKR_HOST, config.IBKR_PORT, clientId=cid)
     _LOOP = _ibutil.getLoop()
     _LOOP_OWNER_IDENT = _threading.get_ident()
+    # Surface real IBKR error events in the log (deduped against benign codes).
+    try:
+        ib.errorEvent += _log_ib_error
+    except Exception:
+        pass
     return ib
 
 
@@ -304,11 +328,20 @@ _POLL_RETRIES = 1
 
 
 def get_opening_range_bar(ib: IB, contract: Stock, opening_time: str):
-    """Return the 5-min bar that starts at opening_time (NL local HH:MM), or None."""
-    bars = get_historical_bars(ib, contract, "3600 S", "5 mins", use_rth=True,
+    """Return today's 5-min opening bar at opening_time (NL local HH:MM), or None.
+
+    Uses a session-spanning duration (8h RTH) rather than a 1-hour window: a
+    small rolling window scrolls the 09:30 ET opening bar out within an hour, so
+    the exact-time match silently failed all session (the "opening candle not
+    available" bug). Filters to TODAY so it can't match yesterday's same-time bar
+    that IBKR backfills into the window early in the session.
+    """
+    bars = get_historical_bars(ib, contract, "28800 S", "5 mins", use_rth=True,
                                retries=_POLL_RETRIES)
+    today = _dt.datetime.now(NL).date()
     for bar in bars:
-        if bar.date.astimezone(NL).strftime("%H:%M") == opening_time:
+        d = bar.date.astimezone(NL)
+        if d.date() == today and d.strftime("%H:%M") == opening_time:
             return bar
     return None
 
